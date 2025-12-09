@@ -843,7 +843,7 @@ def index():
             <span class="label">Kontoauszug CSV</span>
             <div id="konto_drop" class="dropzone">
               <div>CSV hierhin ziehen oder klicken</div>
-              <small>Erwartet: Kontoauszug-Export aus DATEV</small>
+              <small>Erwartet: Quartal-Umsatzübersicht-Export aus Online-Banking</small>
               <div class="filename" id="konto_filename">Keine Datei ausgewählt</div>
             </div>
             <input class="file-input" type="file" name="konto_file" id="konto_file" accept=".csv" required />
@@ -853,7 +853,7 @@ def index():
             <span class="label">Belege CSV</span>
             <div id="belege_drop" class="dropzone">
               <div>CSV hierhin ziehen oder klicken</div>
-              <small>Erwartet: Beleg-Export aus DATEV (mit Spalte "Gebucht")</small>
+              <small>Erwartet: Belegübersicht-Export aus DATEV (mit Spalte "Gebucht")</small>
               <div class="filename" id="belege_filename">Keine Datei ausgewählt</div>
             </div>
             <input class="file-input" type="file" name="belege_file" id="belege_file" accept=".csv" required />
