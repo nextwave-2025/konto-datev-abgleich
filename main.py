@@ -30,28 +30,23 @@ DATUM_FENSTER_TAGE = 30
 # Falls du eine bestimmte Status-Spalte erzwingen willst (z.B. "Gebucht"):
 STATUS_SPALTE_MANUELL = None
 
-# KPI-Fallback (nur wenn wir gar nichts ableiten können) – kann None bleiben
-# Empfehlung: None lassen, weil wir bei euch sauber über BU/Konto ableiten.
+# KPI-Fallback (nur wenn gar nichts ableitbar) – Empfehlung: None lassen
 DEFAULT_RATE_FALLBACK = None  # z.B. 0.19
 
-# BU -> Steuersatz Mapping (DATEV-typisch)
-# Bei eurer Datei war BU 401 eindeutig 19% (Vorsteuer) in vielen Eingangsbelegen
+# BU -> Steuersatz Mapping (DATEV-typisch / eure Daten)
 BU_RATE_MAP = {
-    "401": 0.19,
-    "402": 0.07,   # häufig 7% Vorsteuer (wenn bei euch genutzt)
-    # andere BU-Codes bei euch: 490, 506, 701, 511 ...
-    # Diese sind je nach Konfiguration oft "steuerfrei/sonstige" oder Spezialfälle.
-    # Wir behandeln unbekannte BU konservativ als 0.0 (steuerfrei), außer es gibt einen besseren Hinweis.
+    "401": 0.19,   # sehr häufig 19% Vorsteuer in euren Eingangsbelegen
+    "402": 0.07,   # falls bei euch genutzt
 }
 
-# Outgoing (Debitor) – Konten in eurer Datei sind u.a. 4400, 4120, 4125 (sehr wahrscheinlich Erlöse 19%)
+# Outgoing Erlöskonten -> Steuersatz (aus euren Daten beobachtet)
 OUTGOING_KONTO_RATE = {
     "4400": 0.19,
     "4120": 0.19,
     "4125": 0.19,
 }
 
-# Reverse-Charge / Ausland Keywords
+# Reverse-Charge / Ausland Keywords (unterstützend, nicht allein entscheidend)
 RC_KEYWORDS = [
     "reverse charge", "rev. charge", "rc-verfahren",
     "§13b", "13b", "paragraf 13b",
@@ -81,7 +76,6 @@ def safe_read_csv(path: Path, sep=";") -> pd.DataFrame:
             return pd.read_csv(path, sep=sep, dtype=str, encoding=enc)
         except Exception:
             continue
-    # letzter Versuch ohne encoding
     return pd.read_csv(path, sep=sep, dtype=str)
 
 
@@ -199,9 +193,12 @@ def score_match(konto_text, beleg_supplier_text, invoice_number):
     if invoice_number:
         inv_clean = re.sub(r"[^a-zA-Z0-9]", "", str(invoice_number).strip().lower())
         partials = set()
-        if len(inv_clean) >= 4: partials.add(inv_clean[-4:])
-        if len(inv_clean) >= 6: partials.add(inv_clean[-6:])
-        if len(inv_clean) >= 8: partials.add(inv_clean[-8:])
+        if len(inv_clean) >= 4:
+            partials.add(inv_clean[-4:])
+        if len(inv_clean) >= 6:
+            partials.add(inv_clean[-6:])
+        if len(inv_clean) >= 8:
+            partials.add(inv_clean[-8:])
         partials.add(inv_clean)
 
         for p in partials:
@@ -233,14 +230,14 @@ def looks_like_cash_booking(konto_text, amount):
 
 
 # ============================================================
-# KPI / USt & Betriebsergebnis (DATEV-spezifisch)
+# KPI / USt & Betriebsergebnis
 # ============================================================
 
 def classify_direction_by_partnerkonto(gp_konto: str) -> str:
     """
-    In eurer Datei:
-    - Debitoren (Kunden) sind häufig 1xxxx (z.B. 11004, 11201, ...)
-    - Kreditoren (Lieferanten) sind häufig 7xxxx (z.B. 71201, 72701, ...)
+    Heuristik anhand Geschäftspartner-Konto (eure Daten):
+    - Debitoren (Kunden) häufig 1xxxx (z.B. 11004, 11201, ...)
+    - Kreditoren (Lieferanten) häufig 7xxxx (z.B. 71201, 72701, ...)
     """
     s = str(gp_konto or "").strip()
     if re.match(r"^1\d{3,}$", s):
@@ -274,23 +271,22 @@ def is_usd(row) -> bool:
     return wkz == "USD"
 
 
-def is_reverse_charge_or_foreign(row) -> bool:
-    # Land ist in eurer Datei vorhanden, aber im Upload praktisch leer – trotzdem robust.
-    land = str(row.get("Land", "")).strip().upper()
-    if land and land != "DE":
-        return True
+def normalize_country_code(x: str) -> str:
+    s = str(x or "").strip().upper()
+    if not s or s == "NAN":
+        return ""
+    s = s.replace("DEUTSCHLAND", "DE").replace("GERMANY", "DE")
+    s = s.replace("ÖSTERREICH", "AT").replace("OESTERREICH", "AT").replace("AUSTRIA", "AT")
+    s = s.replace("SCHWEIZ", "CH").replace("SWITZERLAND", "CH")
+    m = re.search(r"\b([A-Z]{2})\b", s)
+    return m.group(1) if m else ""
 
-    vatid = str(row.get("USt-IdNr.", "")).strip().upper().replace(" ", "")
-    # Nicht-DE VAT-ID (z.B. ATU..., CHE..., etc.) -> Ausland/RC
-    if vatid and len(vatid) >= 2 and not vatid.startswith("DE"):
-        return True
 
-    txt = str(row.get("beleg_fulltext", "")).lower()
-    if any(k in txt for k in RC_KEYWORDS):
-        # Wenn Keywords auftauchen, behandeln wir es als Ausland/RC (für KPI ignorieren)
-        return True
-
-    return False
+def vatid_country(vatid: str) -> str:
+    v = str(vatid or "").strip().upper().replace(" ", "")
+    if len(v) >= 2 and re.match(r"^[A-Z]{2}", v):
+        return v[:2]
+    return ""
 
 
 def infer_rate(row) -> tuple[float | None, str]:
@@ -310,22 +306,59 @@ def infer_rate(row) -> tuple[float | None, str]:
         return BU_RATE_MAP[bu], f"bu_{bu}"
 
     # 3) Outgoing Konto Mapping
-    richtung = row.get("richtung", "unknown")
+    richtung = str(row.get("richtung", "unknown")).strip().lower()
     konto = str(row.get("Konto", "")).strip()
     if richtung == "ausgang" and konto in OUTGOING_KONTO_RATE:
         return OUTGOING_KONTO_RATE[konto], f"konto_{konto}"
 
-    # 4) Konservativ: unbekannte BU (490/506/701/511...) -> meistens steuerfrei/Sonderfall
-    # Wir setzen 0.0 (Netto=Brutto, USt=0), damit Betriebsergebnis nicht völlig leer ist.
-    # Gleichzeitig markieren wir die Methode, damit du es transparent siehst.
+    # 4) Unbekannte BU konservativ als 0% (steuerfrei/Sonderfall)
     if bu and bu not in BU_RATE_MAP:
         return 0.0, f"bu_unbekannt_{bu}"
 
-    # 5) Optionaler Fallback (wenn du willst)
+    # 5) Optionaler Fallback
     if DEFAULT_RATE_FALLBACK is not None:
-        return DEFAULT_RATE_FALLBACK, f"fallback_{int(DEFAULT_RATE_FALLBACK*100)}"
+        return DEFAULT_RATE_FALLBACK, f"fallback_{int(DEFAULT_RATE_FALLBACK * 100)}"
 
     return None, "unbekannt"
+
+
+def is_reverse_charge_or_foreign(row) -> bool:
+    """
+    KORRIGIERTE LOGIK (konservativ, richtungsabhängig):
+    Es wird nur ignoriert, wenn es wirklich stark indiziert ist.
+
+    Regeln:
+    - Land eindeutig != DE -> Ausland (ignorieren)
+    - VAT-ID eindeutig != DE und gleichzeitig Steuersatz 0/leer -> sehr wahrscheinlich RC/steuerfrei Ausland (ignorieren)
+    - Keywords alleine reichen NICHT mehr (nur unterstützend + 0/leer)
+    """
+    land = normalize_country_code(row.get("Land", ""))
+    vatid = str(row.get("USt-IdNr.", "")).strip().upper().replace(" ", "")
+    vatid_cc = vatid_country(vatid)
+
+    rate = row.get("steuer_rate", np.nan)
+    try:
+        rate_num = float(rate) if rate == rate else np.nan
+    except Exception:
+        rate_num = np.nan
+    rate_empty_or_zero = pd.isna(rate_num) or abs(rate_num) < 1e-9
+
+    txt = str(row.get("beleg_fulltext", "")).lower()
+    has_rc_keyword = any(k in txt for k in RC_KEYWORDS)
+
+    # 1) Land vorhanden und nicht DE => Ausland
+    if land and land != "DE":
+        return True
+
+    # 2) VAT-ID != DE NUR dann ignorieren, wenn Steuersatz 0/leer (RC/steuerfrei Indiz)
+    if vatid_cc and vatid_cc != "DE" and rate_empty_or_zero:
+        return True
+
+    # 3) Keywords nur unterstützend + 0/leer
+    if has_rc_keyword and rate_empty_or_zero:
+        return True
+
+    return False
 
 
 def compute_vat_net_kpi(belege: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
@@ -335,7 +368,8 @@ def compute_vat_net_kpi(belege: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
     - Vorsteuer Eingang (eingang)
     - USt-Saldo
     - Betriebsergebnis (Umsatz netto - Kosten netto)
-    Nur KPI-relevant: NICHT USD und NICHT ReverseCharge/Ausland.
+
+    KPI-relevant: NICHT USD und NICHT ReverseCharge/Ausland.
     """
 
     # Brutto
@@ -349,22 +383,25 @@ def compute_vat_net_kpi(belege: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
     # Volltext
     belege = build_beleg_fulltext(belege)
 
-    # KPI Ignore Flags
+    # USD Flag (sofort)
     belege["kpi_ignore_usd"] = belege.apply(is_usd, axis=1)
-    belege["kpi_ignore_rc"] = belege.apply(is_reverse_charge_or_foreign, axis=1)
-    belege["kpi_ignore"] = belege["kpi_ignore_usd"] | belege["kpi_ignore_rc"]
 
-    # Rate + Methode
+    # WICHTIG: erst rate bestimmen, dann RC/Ausland anhand rate
     rates = belege.apply(infer_rate, axis=1, result_type="expand")
     belege["steuer_rate"] = rates[0]
     belege["vat_methode"] = rates[1]
+
+    # RC/Ausland jetzt korrekt
+    belege["kpi_ignore_rc"] = belege.apply(is_reverse_charge_or_foreign, axis=1)
+
+    # Gesamtes Ignore
+    belege["kpi_ignore"] = belege["kpi_ignore_usd"] | belege["kpi_ignore_rc"]
 
     # VAT/Netto
     belege["ust_calc"] = np.nan
     belege["netto_calc"] = np.nan
 
     mask_rate = belege["brutto_calc"].notna() & belege["steuer_rate"].notna() & (~belege["kpi_ignore"])
-    # VAT = Brutto - Brutto/(1+rate)
     belege.loc[mask_rate, "ust_calc"] = (
         belege.loc[mask_rate, "brutto_calc"] - (belege.loc[mask_rate, "brutto_calc"] / (1.0 + belege.loc[mask_rate, "steuer_rate"]))
     ).round(2)
@@ -372,7 +409,7 @@ def compute_vat_net_kpi(belege: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
         belege.loc[mask_rate, "brutto_calc"] - belege.loc[mask_rate, "ust_calc"]
     ).round(2)
 
-    # Falls rate=0.0 (steuerfrei) -> netto=brutto, ust=0
+    # rate=0.0 (steuerfrei) -> netto=brutto, ust=0
     mask_zero = belege["brutto_calc"].notna() & (~belege["kpi_ignore"]) & (belege["steuer_rate"] == 0.0)
     belege.loc[mask_zero, "ust_calc"] = 0.0
     belege.loc[mask_zero, "netto_calc"] = belege.loc[mask_zero, "brutto_calc"].round(2)
@@ -380,7 +417,6 @@ def compute_vat_net_kpi(belege: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
     # KPI Subset
     kpi = belege[~belege["kpi_ignore"]].copy()
 
-    # Summen (nur wo netto/ust vorhanden)
     out_ok = (kpi["richtung"] == "ausgang") & kpi["ust_calc"].notna() & kpi["netto_calc"].notna()
     in_ok = (kpi["richtung"] == "eingang") & kpi["ust_calc"].notna() & kpi["netto_calc"].notna()
 
@@ -392,7 +428,6 @@ def compute_vat_net_kpi(belege: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
     kosten_netto = float(kpi.loc[in_ok, "netto_calc"].sum())
     betriebsergebnis = round(umsatz_netto - kosten_netto, 2)
 
-    # Coverage / Diagnostik
     out_total = int((kpi["richtung"] == "ausgang").sum())
     in_total = int((kpi["richtung"] == "eingang").sum())
     out_cov = int(out_ok.sum())
@@ -403,7 +438,6 @@ def compute_vat_net_kpi(belege: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
     ignored_rc = int(belege["kpi_ignore_rc"].sum())
     brutto_ignored = float(belege.loc[belege["kpi_ignore"], "brutto_calc"].fillna(0).sum())
 
-    # Methode-Stats
     methode_stats = (
         kpi["vat_methode"].value_counts(dropna=False).rename_axis("vat_methode").reset_index(name="count")
     )
@@ -426,21 +460,21 @@ def compute_vat_net_kpi(belege: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
         "brutto_ignored": round(brutto_ignored, 2),
     }
 
-    # CSV Outputs für KPI
+    # KPI Outputs
     pd.DataFrame([res]).to_csv(OUTPUT_DIR / "ust_betriebsergebnis.csv", sep=";", index=False, encoding="utf-8-sig")
     methode_stats.to_csv(OUTPUT_DIR / "ust_methoden_stats.csv", sep=";", index=False, encoding="utf-8-sig")
 
-    # Debug: Ignorierte Belege
+    # Debug Files
     debug_cols = [c for c in [
         "Geschäftspartner-Name", "Geschäftspartner-Konto", "Rechnungsbetrag", "WKZ",
         "BU", "Konto", "Steuer in %", "USt-IdNr.", "Land", "richtung",
         "steuer_rate", "vat_methode", "brutto_calc", "netto_calc", "ust_calc", "Rechnungs-Nr."
     ] if c in belege.columns]
+
     belege.loc[belege["kpi_ignore"], debug_cols].to_csv(
         OUTPUT_DIR / "kpi_ignoriert.csv", sep=";", index=False, encoding="utf-8-sig"
     )
 
-    # Debug: KPI-Belege ohne Berechnung (Coverage-Löcher)
     kpi.loc[(kpi["netto_calc"].isna()) | (kpi["ust_calc"].isna()), debug_cols].to_csv(
         OUTPUT_DIR / "kpi_offen.csv", sep=";", index=False, encoding="utf-8-sig"
     )
@@ -499,8 +533,14 @@ def run_analysis():
         belege["datum_norm"] = pd.NaT
 
     # Lieferant/Kunde + Rechnungsnr
-    supplier_cols = [c for c in belege.columns if any(k in c.lower() for k in ["geschäftspartner-name", "geschaeftspartner-name", "lieferant", "name", "kunde"])]
-    invoice_cols = [c for c in belege.columns if any(k in c.lower() for k in ["rechnungs-nr", "rechnungsnummer", "interne re"])]
+    supplier_cols = [
+        c for c in belege.columns
+        if any(k in c.lower() for k in ["geschäftspartner-name", "geschaeftspartner-name", "lieferant", "name", "kunde"])
+    ]
+    invoice_cols = [
+        c for c in belege.columns
+        if any(k in c.lower() for k in ["rechnungs-nr", "rechnungsnummer", "interne re"])
+    ]
     belege["supplier_text"] = belege.apply(lambda row: extract_supplier_text(row, supplier_cols, invoice_cols), axis=1)
 
     invoice_main_col = find_column(belege, ["rechnungs-nr.", "rechnungsnummer"], default=None, prefer_contains="rechnungs")
@@ -525,7 +565,7 @@ def run_analysis():
     belege, kpi_res = compute_vat_net_kpi(belege)
 
     # ============================================================
-    # Matching (deine vorhandene Logik)
+    # Matching (bestehende Logik)
     # ============================================================
     sichere_matches = []
     unklare_map = {}
@@ -540,7 +580,6 @@ def run_analysis():
             continue
 
         betrag_abs = abs(float(betrag))
-
         candidates = konto[(konto["betrag_raw"].abs().sub(betrag_abs).abs() <= BETRAG_TOLERANZ)].copy()
         if candidates.empty:
             continue
@@ -695,7 +734,8 @@ def run_analysis():
 
     konto_ohne_beleg = konto[~konto["konto_index"].isin(alle_verwendeten_konto)].copy()
     konto_ohne_beleg["ist_kasse_vermutet"] = konto_ohne_beleg.apply(
-        lambda row: looks_like_cash_booking(row["text_gesamt"], row["betrag_raw"]), axis=1
+        lambda row: looks_like_cash_booking(row["text_gesamt"], row["betrag_raw"]),
+        axis=1
     )
 
     # Vorschlagsliste Posteingang
@@ -773,7 +813,7 @@ def run_analysis():
         "anzahl_unklar": anzahl_unklar,
         "anzahl_fehlende": anzahl_fehlende,
         "anzahl_kasse": anzahl_kasse,
-        **kpi_res
+        **kpi_res,
     }
 
 
