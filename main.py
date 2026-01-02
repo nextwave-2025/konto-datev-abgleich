@@ -46,7 +46,7 @@ RC_KEYWORDS = [
     "export", "ausfuhr", "ig-erwerb", "ig erwerb"
 ]
 
-NEXTWAVE_ORANGE = "#DE6A00"
+NEXTWAVE_ORANGE = "#F15124"
 NEXTWAVE_DARK = "#111827"
 NEXTWAVE_BLUE = "#2563eb"
 
