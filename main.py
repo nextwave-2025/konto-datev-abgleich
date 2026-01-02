@@ -7,7 +7,7 @@ from datetime import datetime
 import numpy as np
 import pandas as pd
 
-from fastapi import FastAPI, UploadFile, File
+from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.responses import HTMLResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 import uvicorn
@@ -65,6 +65,11 @@ RC_KEYWORDS = [
     "export", "ausfuhr", "ig-erwerb", "ig erwerb"
 ]
 
+# UI / Branding
+NEXTWAVE_ORANGE = "#DE6A00"  # dein Orange (falls du einen anderen Code willst: hier ändern)
+NEXTWAVE_DARK = "#111827"
+NEXTWAVE_BLUE = "#2563eb"
+
 # ============================================================
 # FASTAPI
 # ============================================================
@@ -76,18 +81,63 @@ app.mount("/static", StaticFiles(directory=BASE_DIR), name="static")
 # WECLAPP – ENV / STATUS / API-CHECK
 # ============================================================
 
+def _get_env_any(*names: str) -> str:
+    """Liest die erste nicht-leere ENV-Variable aus einer Liste aus."""
+    for n in names:
+        v = os.getenv(n)
+        if v is not None and str(v).strip() != "":
+            return str(v).strip()
+    return ""
+
 def weclapp_base_url() -> str:
-    # genau wie in Railway gesetzt:
-    return os.getenv("WECLAPP_BASE_URL", "").strip()
+    """
+    Akzeptiert mehrere mögliche ENV-Namen und normalisiert die URL.
+    Unterstützt:
+    - vollständige API-Base: https://<tenant>.weclapp.com/webapp/api/v1
+    - nur Tenant-URL:        https://<tenant>.weclapp.com
+    - oder ohne https:        <tenant>.weclapp.com/webapp/api/v1
+    """
+    raw = _get_env_any(
+        "WECLAPP_BASE_URL",
+        "WECLAPP_API_BASE_URL",
+        "WECLAPP_URL",
+        "WECLAPP_BASEURL",
+    )
+    raw = raw.strip().strip('"').strip("'")
+    if not raw:
+        return ""
+
+    # Scheme ergänzen, wenn fehlt
+    if not raw.lower().startswith(("http://", "https://")):
+        raw = "https://" + raw
+
+    # Trailing slash weg
+    raw = raw.rstrip("/")
+
+    # Falls nur Domain gegeben ist, API-Pfad ergänzen
+    if "/webapp/api/v1" not in raw.lower():
+        raw = raw + "/webapp/api/v1"
+
+    return raw
 
 def weclapp_token() -> str:
-    # genau wie in Railway gesetzt:
-    return os.getenv("WECLAPP_API_TOKEN", "").strip()
+    """
+    Akzeptiert mehrere mögliche ENV-Namen.
+    """
+    raw = _get_env_any(
+        "WECLAPP_API_TOKEN",
+        "WECLAPP_TOKEN",
+        "WECLAPP_AUTH_TOKEN",
+        "WECLAPP_APIKEY",
+    )
+    raw = raw.strip().strip('"').strip("'")
+    return raw
 
 def weclapp_configured() -> bool:
     return bool(weclapp_base_url() and weclapp_token())
 
 def weclapp_headers() -> dict:
+    # Weclapp erwartet typischerweise AuthenticationToken-Header
     return {"AuthenticationToken": weclapp_token()}
 
 def weclapp_check_company() -> tuple[bool, str]:
@@ -96,19 +146,35 @@ def weclapp_check_company() -> tuple[bool, str]:
     Nutzt GET /company.
     """
     if not weclapp_configured():
-        return False, "nicht konfiguriert (WECLAPP_BASE_URL/WECLAPP_API_TOKEN fehlen)"
+        # Keine ENV-Details im UI – nur klarer Hinweis
+        return False, "nicht verbunden"
 
     if requests is None:
-        return False, "requests fehlt (Python package). Bitte requests in requirements.txt aufnehmen."
+        return False, "requests fehlt (Package). Bitte 'requests' in requirements.txt aufnehmen."
 
     url = weclapp_base_url().rstrip("/") + "/company"
+
     try:
         r = requests.get(url, headers=weclapp_headers(), timeout=15)
+
+        # Häufigste Auth-Fehler sauber benennen
+        if r.status_code in (401, 403):
+            return False, f"verbunden, aber Token ungültig (HTTP {r.status_code})"
+
         if r.status_code < 300:
-            return True, "konfiguriert (API OK)"
-        return False, f"konfiguriert, aber API-Fehler (HTTP {r.status_code})"
+            return True, "verbunden"
+        return False, f"verbunden, aber API-Fehler (HTTP {r.status_code})"
     except Exception as e:
-        return False, f"konfiguriert, aber Verbindung fehlgeschlagen: {str(e)}"
+        return False, f"verbunden, aber Verbindung fehlgeschlagen: {str(e)}"
+
+# Optional (Debug ohne Token-Leak): nur Server-Logs
+def log_weclapp_env_state():
+    try:
+        base = weclapp_base_url()
+        tok = weclapp_token()
+        print("[WECLAPP] base_url_set:", bool(base), "token_set:", bool(tok), "base_url:", base)
+    except Exception:
+        pass
 
 # ============================================================
 # HELPER
@@ -806,12 +872,13 @@ def format_eur(x) -> str:
 
 @app.get("/", response_class=HTMLResponse)
 def index():
+    # optional: Server-Log hilft dir auf Railway sofort zu sehen, ob ENV wirklich ankommt
+    log_weclapp_env_state()
+
     ok, msg = weclapp_check_company()
     status_badge = "✅ " + msg if ok else "⚠️ " + msg
 
     today = datetime.now().date()
-    # Standard: aktuelles Quartal grob (nur UI-Vorschlag)
-    # Du kannst hier später automatisch Q1/Q2/... setzen – aktuell reicht start/end input.
     default_from = f"{today.year}-01-01"
     default_to = f"{today.year}-03-31"
 
@@ -829,20 +896,27 @@ def index():
           input[type="date"] {{ padding:10px; border:1px solid #d1d5db; border-radius:8px; min-width: 180px; }}
           .field {{ margin-top: 12px; }}
           .dropzone {{ border:2px dashed #999; border-radius:8px; padding:14px; text-align:center; cursor:pointer; transition:.2s; }}
-          .dropzone.hover {{ border-color:#2563eb; background:#eff6ff; }}
+          .dropzone.hover {{ border-color:{NEXTWAVE_BLUE}; background:#eff6ff; }}
           .filename {{ font-weight:600; margin-top:6px; }}
           .file-input {{ display:none; }}
-          button {{ padding:10px 18px; font-size:16px; border-radius:8px; border:none; background:#2563eb; color:white; cursor:pointer; }}
-          button:hover {{ background:#1d4ed8; }}
-          .btn-secondary {{ background:#111827; }}
-          .btn-secondary:hover {{ background:#0b1220; }}
-          .progress {{ margin-top:1rem; font-size:0.9rem; color:#2563eb; display:none; align-items:center; gap:8px; }}
+
+          /* Buttons */
+          button {{ padding:10px 18px; font-size:16px; border-radius:8px; border:none; color:white; cursor:pointer; }}
+          button:disabled {{ opacity:0.7; cursor:not-allowed; }}
+
+          .btn-dark {{ background:{NEXTWAVE_DARK}; }}
+          .btn-dark:hover {{ background:#0b1220; }}
+
+          .btn-orange {{ background:{NEXTWAVE_ORANGE} !important; }}
+          .btn-orange:hover {{ filter: brightness(0.92); }}
+
+          .progress {{ margin-top:1rem; font-size:0.9rem; color:{NEXTWAVE_BLUE}; display:none; align-items:center; gap:8px; }}
           .progress.active {{ display:inline-flex; }}
-          .spinner {{ width:18px; height:18px; border-radius:999px; border:3px solid #e5e7eb; border-top-color:#2563eb; animation: spin 0.8s linear infinite; }}
+          .spinner {{ width:18px; height:18px; border-radius:999px; border:3px solid #e5e7eb; border-top-color:{NEXTWAVE_BLUE}; animation: spin 0.8s linear infinite; }}
           @keyframes spin {{ from {{ transform: rotate(0deg);}} to {{ transform: rotate(360deg);}} }}
+
           .legal {{ margin-top:1.2rem; font-size:0.75rem; color:#777; line-height:1.4; }}
           .status {{ font-size: 0.95rem; color:#374151; }}
-          code {{ background:#f3f4f6; padding:2px 6px; border-radius:6px; }}
         </style>
       </head>
       <body>
@@ -850,15 +924,8 @@ def index():
         <h1>Business Finance AI</h1>
         <p class="hint">
 Willkommen bei deiner NEXTWAVE Business Finance AI!<br><br>
-
-Du hast zwei Möglichkeiten:<br><br>
-
-1) Zeitraum auswählen (z. B. letztes Quartal) für automatische USt-Analyse über Weclapp.<br><br>
-
-2) Kontoauszug (Online-Banking) und Belege (DATEV Unternehmen online) hochladen – automatischer Beleg- & Kontenabgleich inkl. Excel-Export.<br><br>
-
-Viel Erfolg!<br>
-Deine NEXTWAVE Business Finance AI
+1) Zeitraum auswählen – automatische USt-Analyse über Weclapp.<br>
+2) Kontoauszug + DATEV-Belege hochladen – Belegabgleich inkl. Excel-Export.<br>
         </p>
 
         <div class="box">
@@ -875,15 +942,14 @@ Deine NEXTWAVE Business Finance AI
           </div>
 
           <div class="field status" style="margin-top:10px;">
-            <strong>Weclapp:</strong> {status_badge}<br>
-            <span style="color:#6b7280;">(ENV: <code>WECLAPP_BASE_URL</code>, <code>WECLAPP_API_TOKEN</code>)</span>
+            <strong>Weclapp:</strong> {status_badge}
           </div>
 
           <!-- ✅ Button direkt UNTER Zeitraum -->
           <form id="weclappForm" action="/weclapp-ust" method="post" style="margin-top:12px;">
             <input type="hidden" name="date_from" id="wf_from" value="{default_from}">
             <input type="hidden" name="date_to" id="wf_to" value="{default_to}">
-            <button type="submit" class="btn-secondary">Weclapp USt-Status berechnen</button>
+            <button type="submit" class="btn-dark">Weclapp USt-Status berechnen</button>
           </form>
         </div>
 
@@ -909,7 +975,8 @@ Deine NEXTWAVE Business Finance AI
               <input class="file-input" type="file" name="belege_file" id="belege_file" accept=".csv" required />
             </div>
 
-            <button type="submit" id="submitBtn">DATEV Analyse starten</button>
+            <!-- ✅ Orange (nicht mehr blau) -->
+            <button type="submit" id="submitBtn" class="btn-orange">DATEV Analyse starten</button>
             <div id="progress" class="progress"><div class="spinner"></div><span>Analyse läuft …</span></div>
           </form>
         </div>
@@ -994,10 +1061,10 @@ Deine NEXTWAVE Business Finance AI
     """
 
 @app.post("/weclapp-ust", response_class=HTMLResponse)
-async def weclapp_ust(date_from: str = "", date_to: str = ""):
+async def weclapp_ust(date_from: str = Form(""), date_to: str = Form("")):
     """
-    Button unter Zeitraum: macht aktuell einen API-Check und legt weclapp_status.csv ab.
-    Die echte Weclapp-USt-Logik hängt vom genutzten Weclapp-Endpoint/Objekt ab.
+    Button unter Zeitraum: macht einen API/Auth-Check und legt weclapp_status.csv ab.
+    (Echte USt-Berechnung über Weclapp-Objekte/Endpoints kommt als nächster Schritt.)
     """
     ok, msg = weclapp_check_company()
 
@@ -1023,7 +1090,7 @@ async def weclapp_ust(date_from: str = "", date_to: str = ""):
           body {{ font-family: system-ui, -apple-system, Segoe UI, sans-serif; max-width: 860px; margin: 40px auto; padding: 0 16px; }}
           .box {{ border:1px solid #e5e7eb; border-radius:12px; padding:14px; background:#fafafa; }}
           .badge {{ display:inline-block; padding:6px 10px; border-radius:999px; background:{color}; color:white; font-weight:600; }}
-          a.button {{ display:inline-block; margin-top: 1.2rem; padding:10px 18px; background:#2563eb; color:#fff; text-decoration:none; border-radius:8px; }}
+          a.button {{ display:inline-block; margin-top: 1.2rem; padding:10px 18px; background:{NEXTWAVE_BLUE}; color:#fff; text-decoration:none; border-radius:8px; }}
           a.button:hover {{ background:#1d4ed8; }}
           code {{ background:#f3f4f6; padding:2px 6px; border-radius:6px; }}
         </style>
@@ -1034,9 +1101,7 @@ async def weclapp_ust(date_from: str = "", date_to: str = ""):
           <div class="badge">{msg}</div>
           <p style="margin-top:12px; color:#374151;">
             Zeitraum: <strong>{date_from or "–"}</strong> bis <strong>{date_to or "–"}</strong><br>
-            Base URL: <code>{weclapp_base_url() or "-"}</code><br><br>
-            Hinweis: Das hier ist aktuell ein stabiler API/Auth-Check. Im nächsten Schritt bauen wir die echte
-            Weclapp-USt-Berechnung (je nach Weclapp-Objekt/Endpoint) ein.
+            API Base: <code>{weclapp_base_url() or "-"}</code><br>
           </p>
           <a class="button" href="/">Zurück</a>
         </div>
@@ -1068,7 +1133,7 @@ async def run(konto_file: UploadFile = File(...), belege_file: UploadFile = File
         <style>
           body {{ font-family: system-ui, -apple-system, Segoe UI, sans-serif; max-width: 860px; margin: 40px auto; padding: 0 16px; }}
           ul {{ line-height: 1.7; }}
-          a.button {{ display:inline-block; margin-top: 1.2rem; padding:10px 18px; background:#2563eb; color:#fff; text-decoration:none; border-radius:8px; }}
+          a.button {{ display:inline-block; margin-top: 1.2rem; padding:10px 18px; background:{NEXTWAVE_BLUE}; color:#fff; text-decoration:none; border-radius:8px; }}
           a.button:hover {{ background:#1d4ed8; }}
           .box {{ border:1px solid #e5e7eb; border-radius:12px; padding:14px; background:#fafafa; margin-top: 12px; }}
           .legal {{ margin-top:2rem; font-size:0.75rem; color:#777; line-height:1.4; }}
@@ -1116,7 +1181,6 @@ async def run(konto_file: UploadFile = File(...), belege_file: UploadFile = File
         <div class="box">
           <h2>Weclapp Status</h2>
           <p style="color:#374151; margin-top:0;">
-            Status wird aus der Railway-Config gelesen und per API-Call geprüft.<br>
             Details in der ZIP: <code>weclapp_status.csv</code>
           </p>
           <ul>
@@ -1148,4 +1212,6 @@ def logo():
     return FileResponse(BASE_DIR / "nextwave_logo.png", media_type="image/png")
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="127.0.0.1", port=8000)
+    # Railway braucht i.d.R. 0.0.0.0 und PORT aus ENV
+    port = int(os.getenv("PORT", "8000"))
+    uvicorn.run(app, host="0.0.0.0", port=port)
