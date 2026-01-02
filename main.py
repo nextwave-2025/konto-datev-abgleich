@@ -818,7 +818,7 @@ def index():
     return f"""
     <html>
       <head>
-        <title>NEXTWAVE AI Buchhaltung</title>
+        <title>NEXTWAVE Business Finance AI</title>
         <style>
           body {{ font-family: system-ui, -apple-system, Segoe UI, sans-serif; max-width: 900px; margin: 40px auto; padding: 0 16px; }}
           .logo {{ max-width: 260px; height: auto; margin-bottom: 10px; display:block; }}
@@ -847,7 +847,7 @@ def index():
       </head>
       <body>
         <img src="/logo.png" alt="NEXTWAVE Logo" class="logo" />
-        <h1>NEXTWAVE Business Finance AI</h1>
+        <h1>Business Finance AI</h1>
         <p class="hint">
 Willkommen bei deiner NEXTWAVE Business Finance AI!<br><br>
 
