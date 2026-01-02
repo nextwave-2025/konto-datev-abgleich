@@ -849,26 +849,19 @@ def index():
         <img src="/logo.png" alt="NEXTWAVE Logo" class="logo" />
         <h1>NEXTWAVE Business Finance AI</h1>
         <p class="hint">
-          Willkommen bei deiner NEXTWAVE Business Finance AI!<br>
-Hier stehen dir zwei leistungsstarke Möglichkeiten zur Verfügung.<br><br>
+Willkommen bei deiner NEXTWAVE Business Finance AI!<br><br>
 
-1) Du kannst einen beliebigen Zeitraum auswählen, z.B. das letzte Quartal.<br>
-NEXTWAVE Business Finance AI berechnet vollautomatisch über den Weclapp-Endpoint deinen aktuellen USt-Status,<br>
-sodass du jederzeit siehst, wie du vorsteuertechnisch aktuell aufgestellt bist.<br><br>
-(API Check &amp; später echte Weclapp-KPI).
+Du hast zwei Möglichkeiten:<br><br>
 
-2) Mit der zweiten Automatisierung lädst du bei <b>Kontoauszug</b> deine Umsatzübersicht aus dem Online-Banking hoch<br>
-und bei <b>Belege</b> einen Export aus DATEV Unternehmen online – jeweils für einen frei wählbaren Zeitraum.<br><br>
+1) Zeitraum auswählen (z. B. letztes Quartal) –<br>
+automatische USt-Analyse über Weclapp.<br><br>
 
-Dein Agent analysiert innerhalb weniger Sekunden,<br>
-welche Belege bereits welchen Kontobewegungen zugeordnet werden konnten<br>
-und welche Belege nicht gefunden oder nicht eindeutig zugeordnet werden konnten.<br><br>
-
-Anschließend erhältst du eine übersichtliche Auswertung per Excel-Export.<br><br>
+2) Kontoauszug (Online-Banking) und Belege<br>
+(DATEV Unternehmen online) hochladen –<br>
+automatischer Beleg- & Kontenabgleich inkl. Excel-Export.<br><br>
 
 Viel Erfolg!<br>
 Deine NEXTWAVE Business Finance AI
-(API Check &amp; später echte Weclapp-KPI).<br>
         </p>
 
         <div class="box">
