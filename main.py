@@ -853,12 +853,9 @@ Willkommen bei deiner NEXTWAVE Business Finance AI!<br><br>
 
 Du hast zwei Möglichkeiten:<br><br>
 
-1) Zeitraum auswählen (z. B. letztes Quartal) –<br>
-automatische USt-Analyse über Weclapp.<br><br>
+1) Zeitraum auswählen (z. B. letztes Quartal) für automatische USt-Analyse über Weclapp.<br><br>
 
-2) Kontoauszug (Online-Banking) und Belege<br>
-(DATEV Unternehmen online) hochladen –<br>
-automatischer Beleg- & Kontenabgleich inkl. Excel-Export.<br><br>
+2) Kontoauszug (Online-Banking) und Belege (DATEV Unternehmen online) hochladen – automatischer Beleg- & Kontenabgleich inkl. Excel-Export.<br><br>
 
 Viel Erfolg!<br>
 Deine NEXTWAVE Business Finance AI
