@@ -922,4 +922,246 @@ def index():
               <input type="date" name="period_from" id="period_from" required />
             </div>
             <div class="field">
-              <span
+              <span class="label">Zeitraum bis</span>
+              <input type="date" name="period_to" id="period_to" required />
+            </div>
+          </div>
+
+          <div class="field">
+            <span class="label">Kontoauszug CSV</span>
+            <div id="konto_drop" class="dropzone">
+              <div>CSV hierhin ziehen oder klicken</div>
+              <div class="filename" id="konto_filename">Keine Datei ausgewählt</div>
+            </div>
+            <input class="file-input" type="file" name="konto_file" id="konto_file" accept=".csv" required />
+          </div>
+
+          <div class="field">
+            <span class="label">Belege CSV</span>
+            <div id="belege_drop" class="dropzone">
+              <div>CSV hierhin ziehen oder klicken</div>
+              <div class="filename" id="belege_filename">Keine Datei ausgewählt</div>
+            </div>
+            <input class="file-input" type="file" name="belege_file" id="belege_file" accept=".csv" required />
+          </div>
+
+          <button type="submit" id="submitBtn">Analyse starten</button>
+          <div id="progress" class="progress">
+            <div class="spinner"></div>
+            <span>Analyse läuft …</span>
+          </div>
+        </form>
+
+        <div class="legal">
+          © NEXTWAVE GmbH – Alle Rechte vorbehalten.<br>
+          Die Nutzung dieses Programms oder von Teilen daraus ohne vorherige schriftliche Zustimmung der NEXTWAVE GmbH
+          ist untersagt und kann zivil- und strafrechtliche Schritte nach sich ziehen.
+        </div>
+
+        <script>
+          function setupDropzone(dropId, inputId, labelId) {{
+            const drop = document.getElementById(dropId);
+            const input = document.getElementById(inputId);
+            const label = document.getElementById(labelId);
+
+            drop.addEventListener('click', function() {{
+              input.click();
+            }});
+
+            input.addEventListener('change', function() {{
+              label.textContent = (input.files && input.files.length) ? input.files[0].name : "Keine Datei ausgewählt";
+            }});
+
+            ['dragenter','dragover'].forEach(eventName => {{
+              drop.addEventListener(eventName, function(e) {{
+                e.preventDefault(); e.stopPropagation();
+                drop.classList.add('hover');
+              }}, false);
+            }});
+
+            ['dragleave','drop'].forEach(eventName => {{
+              drop.addEventListener(eventName, function(e) {{
+                e.preventDefault(); e.stopPropagation();
+                drop.classList.remove('hover');
+              }}, false);
+            }});
+
+            drop.addEventListener('drop', function(e) {{
+              const files = e.dataTransfer.files;
+              if (files && files.length > 0) {{
+                input.files = files;
+                label.textContent = files[0].name;
+              }}
+            }});
+          }}
+
+          function setLastQuarterDefaults() {{
+            const fromEl = document.getElementById('period_from');
+            const toEl = document.getElementById('period_to');
+            if (fromEl.value || toEl.value) return;
+
+            const now = new Date();
+            const y = now.getFullYear();
+            const m = now.getMonth() + 1; // 1-12
+
+            // Current quarter (1..4)
+            const q = Math.floor((m - 1) / 3) + 1;
+            // Last quarter
+            let lq = q - 1;
+            let ly = y;
+            if (lq === 0) {{ lq = 4; ly = y - 1; }}
+
+            const startMonth = (lq - 1) * 3 + 1;
+            const endMonth = startMonth + 2;
+
+            const pad = (n) => String(n).padStart(2, '0');
+            const start = `${{ly}}-${{pad(startMonth)}}-01`;
+
+            // Last day of endMonth
+            const endDate = new Date(ly, endMonth, 0); // day 0 of next month
+            const end = `${{ly}}-${{pad(endMonth)}}-${{pad(endDate.getDate())}}`;
+
+            fromEl.value = start;
+            toEl.value = end;
+          }}
+
+          document.addEventListener('DOMContentLoaded', function() {{
+            setupDropzone('konto_drop', 'konto_file', 'konto_filename');
+            setupDropzone('belege_drop', 'belege_file', 'belege_filename');
+            setLastQuarterDefaults();
+
+            const form = document.getElementById('uploadForm');
+            const submitBtn = document.getElementById('submitBtn');
+            const progress = document.getElementById('progress');
+            const kontoInput = document.getElementById('konto_file');
+            const belegeInput = document.getElementById('belege_file');
+            const pf = document.getElementById('period_from');
+            const pt = document.getElementById('period_to');
+
+            form.addEventListener('submit', function(e) {{
+              if (!kontoInput.files.length || !belegeInput.files.length) {{
+                e.preventDefault();
+                alert('Bitte sowohl Kontoauszug-CSV als auch Belege-CSV auswählen.');
+                return;
+              }}
+              if (!pf.value || !pt.value) {{
+                e.preventDefault();
+                alert('Bitte Zeitraum (von/bis) auswählen.');
+                return;
+              }}
+              submitBtn.disabled = true;
+              submitBtn.textContent = 'Analyse läuft ...';
+              progress.classList.add('active');
+            }});
+          }});
+        </script>
+      </body>
+    </html>
+    """
+
+@app.post("/run", response_class=HTMLResponse)
+async def run(
+    konto_file: UploadFile = File(...),
+    belege_file: UploadFile = File(...),
+    period_from: str = Form(...),
+    period_to: str = Form(...)
+):
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    with open(KONTOAUSZUG_CSV, "wb") as f:
+        f.write(await konto_file.read())
+    with open(BELEGE_CSV, "wb") as f:
+        f.write(await belege_file.read())
+
+    res = run_analysis(period_from, period_to)
+
+    # ZIP bauen: alle CSVs + weclapp Excel
+    zip_path = OUTPUT_DIR / "datev_analyse_ergebnisse.zip"
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        for p in OUTPUT_DIR.glob("*.csv"):
+            zf.write(p, arcname=p.name)
+        for p in OUTPUT_DIR.glob("weclapp_ust_details.xlsx"):
+            zf.write(p, arcname=p.name)
+
+    # Weclapp Summary
+    w = res.get("weclapp", {}) or {}
+    weclapp_html = ""
+    if not w.get("enabled"):
+        weclapp_html = f"""
+          <div class="box">
+            <h2>Weclapp USt-Status</h2>
+            <p style="color:#b91c1c;"><strong>Weclapp nicht aktiv:</strong> {w.get("error","")}</p>
+            <p style="color:#374151;">Tipp: ENV setzen: <code>WECLAPP_BASE_URL</code> &amp; <code>WECLAPP_API_TOKEN</code></p>
+          </div>
+        """
+    else:
+        weclapp_html = f"""
+          <div class="box">
+            <h2>Weclapp USt-Status ({res['period_from']} bis {res['period_to']})</h2>
+            <ul>
+              <li><strong>Vorsteuer (Purchase):</strong> {w.get('vorsteuer_sum',0):.2f} €</li>
+              <li><strong>Umsatzsteuer (Sales):</strong> {w.get('umsatzsteuer_sum',0):.2f} €</li>
+              <li><strong>Saldo (Vorsteuer - Umsatzsteuer):</strong> {w.get('saldo',0):.2f} €</li>
+              <li><strong>Status:</strong> {w.get('status','')}</li>
+              <li><strong>Berücksichtigte Belege:</strong> Sales {w.get('sales_count',0)}, Purchase {w.get('purchase_count',0)} (Entity: {w.get('purchase_entity_used','')})</li>
+              <li><strong>Export:</strong> <code>weclapp_ust_details.xlsx</code> (in der ZIP)</li>
+            </ul>
+          </div>
+        """
+
+    return f"""
+    <html>
+      <head>
+        <title>Analyse abgeschlossen</title>
+        <style>
+          body {{ font-family: system-ui, -apple-system, Segoe UI, sans-serif; max-width: 900px; margin: 40px auto; padding: 0 16px; }}
+          ul {{ line-height: 1.7; }}
+          a.button {{ display:inline-block; margin-top: 1.2rem; padding:10px 18px; background:#2563eb; color:#fff; text-decoration:none; border-radius:6px; }}
+          a.button:hover {{ background:#1d4ed8; }}
+          .box {{ border:1px solid #e5e7eb; border-radius:10px; padding:14px; background:#fafafa; margin-top: 12px; }}
+          .legal {{ margin-top:2rem; font-size:0.75rem; color:#777; line-height:1.4; }}
+        </style>
+      </head>
+      <body>
+        <h1>Analyse abgeschlossen</h1>
+
+        <div class="box">
+          <h2>Matching</h2>
+          <ul>
+            <li><strong>Sichere Matches gesamt:</strong> {res['anzahl_sicher']}</li>
+            <li>&nbsp;&nbsp;&bull; davon gebuchte Belege: {res['anzahl_sicher_gebucht']}</li>
+            <li>&nbsp;&nbsp;&bull; davon Posteingang-Rechnungen: {res['anzahl_sicher_post']}</li>
+            <li>&nbsp;&nbsp;&bull; davon Rechnungsnr im Kontoauszug (Invoice-First): {res.get('anzahl_sicher_invoice',0)}</li>
+            <li><strong>Unklare Fälle:</strong> {res['anzahl_unklar']}</li>
+            <li><strong>Konto ohne Beleg:</strong> {res['anzahl_fehlende']}</li>
+            <li>&nbsp;&nbsp;&bull; davon Kassenbuchungen vermutet: {res['anzahl_kasse']}</li>
+          </ul>
+        </div>
+
+        {weclapp_html}
+
+        <a href="/download" class="button">Ergebnis-ZIP herunterladen</a>
+        <div style="margin-top:1rem;"><a href="/">Neue Analyse starten</a></div>
+
+        <div class="legal">
+          © NEXTWAVE GmbH – Alle Rechte vorbehalten.<br>
+          Die Nutzung dieses Programms oder von Teilen daraus ohne vorherige schriftliche Zustimmung der NEXTWAVE GmbH
+          ist untersagt und kann zivil- und strafrechtliche Schritte nach sich ziehen.
+        </div>
+      </body>
+    </html>
+    """
+
+@app.get("/download")
+def download_zip():
+    zip_path = OUTPUT_DIR / "datev_analyse_ergebnisse.zip"
+    if not zip_path.exists():
+        return HTMLResponse("<h1>Keine ZIP gefunden</h1><p>Bitte zuerst eine Analyse starten.</p>", status_code=404)
+    return FileResponse(zip_path, media_type="application/zip", filename="datev_analyse_ergebnisse.zip")
+
+@app.get("/logo.png")
+def logo():
+    return FileResponse(BASE_DIR / "nextwave_logo.png", media_type="image/png")
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="127.0.0.1", port=8000)
