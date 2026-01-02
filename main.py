@@ -12,7 +12,6 @@ from fastapi.responses import HTMLResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 import uvicorn
 
-# Optional: requests (sehr üblich). Falls nicht vorhanden, bitte in requirements aufnehmen.
 try:
     import requests
 except Exception:
@@ -23,39 +22,21 @@ except Exception:
 # ============================================================
 
 BASE_DIR = Path(__file__).parent
-
-# Eingangsdateien (werden bei Upload überschrieben)
 KONTOAUSZUG_CSV = BASE_DIR / "kontoauszug.csv"
 BELEGE_CSV = BASE_DIR / "belege.csv"
 
-# Ausgabe
 OUTPUT_DIR = BASE_DIR / "output"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-# Matching-Toleranzen
 BETRAG_TOLERANZ = 0.01
 DATUM_FENSTER_TAGE = 30
 
-# Falls du eine bestimmte Status-Spalte erzwingen willst (z.B. "Gebucht"):
 STATUS_SPALTE_MANUELL = None
+DEFAULT_RATE_FALLBACK = None
 
-# KPI-Fallback (nur wenn gar nichts ableitbar) – Empfehlung: None lassen
-DEFAULT_RATE_FALLBACK = None  # z.B. 0.19
+BU_RATE_MAP = {"401": 0.19, "402": 0.07}
+OUTGOING_KONTO_RATE = {"4400": 0.19, "4120": 0.19, "4125": 0.19}
 
-# BU -> Steuersatz Mapping (DATEV-typisch / eure Daten)
-BU_RATE_MAP = {
-    "401": 0.19,
-    "402": 0.07,
-}
-
-# Outgoing Erlöskonten -> Steuersatz (aus euren Daten beobachtet)
-OUTGOING_KONTO_RATE = {
-    "4400": 0.19,
-    "4120": 0.19,
-    "4125": 0.19,
-}
-
-# Reverse-Charge / Ausland Keywords (unterstützend, nicht allein entscheidend)
 RC_KEYWORDS = [
     "reverse charge", "rev. charge", "rc-verfahren",
     "§13b", "13b", "paragraf 13b",
@@ -65,10 +46,9 @@ RC_KEYWORDS = [
     "export", "ausfuhr", "ig-erwerb", "ig erwerb"
 ]
 
-# UI / Branding
-NEXTWAVE_ORANGE = "#F15124"  # dein Orange (falls du einen anderen Code willst: hier ändern)
+NEXTWAVE_ORANGE = "#DE6A00"
 NEXTWAVE_DARK = "#111827"
-NEXTWAVE_BLUE = "#F15124"
+NEXTWAVE_BLUE = "#2563eb"
 
 # ============================================================
 # FASTAPI
@@ -82,7 +62,6 @@ app.mount("/static", StaticFiles(directory=BASE_DIR), name="static")
 # ============================================================
 
 def _get_env_any(*names: str) -> str:
-    """Liest die erste nicht-leere ENV-Variable aus einer Liste aus."""
     for n in names:
         v = os.getenv(n)
         if v is not None and str(v).strip() != "":
@@ -90,13 +69,6 @@ def _get_env_any(*names: str) -> str:
     return ""
 
 def weclapp_base_url() -> str:
-    """
-    Akzeptiert mehrere mögliche ENV-Namen und normalisiert die URL.
-    Unterstützt:
-    - vollständige API-Base: https://<tenant>.weclapp.com/webapp/api/v1
-    - nur Tenant-URL:        https://<tenant>.weclapp.com
-    - oder ohne https:        <tenant>.weclapp.com/webapp/api/v1
-    """
     raw = _get_env_any(
         "WECLAPP_BASE_URL",
         "WECLAPP_API_BASE_URL",
@@ -106,29 +78,20 @@ def weclapp_base_url() -> str:
     raw = raw.strip().strip('"').strip("'")
     if not raw:
         return ""
-
-    # Scheme ergänzen, wenn fehlt
     if not raw.lower().startswith(("http://", "https://")):
         raw = "https://" + raw
-
-    # Trailing slash weg
     raw = raw.rstrip("/")
-
-    # Falls nur Domain gegeben ist, API-Pfad ergänzen
     if "/webapp/api/v1" not in raw.lower():
         raw = raw + "/webapp/api/v1"
-
     return raw
 
 def weclapp_token() -> str:
-    """
-    Akzeptiert mehrere mögliche ENV-Namen.
-    """
     raw = _get_env_any(
         "WECLAPP_API_TOKEN",
         "WECLAPP_TOKEN",
         "WECLAPP_AUTH_TOKEN",
-        "WECLAPP_APIKEY",
+        "WECLAPP_AUTHENTICATIONTOKEN",
+        "AUTHENTICATIONTOKEN",
     )
     raw = raw.strip().strip('"').strip("'")
     return raw
@@ -137,44 +100,44 @@ def weclapp_configured() -> bool:
     return bool(weclapp_base_url() and weclapp_token())
 
 def weclapp_headers() -> dict:
-    # Weclapp erwartet typischerweise AuthenticationToken-Header
     return {"AuthenticationToken": weclapp_token()}
 
+def log_env_keys():
+    """
+    Debug: zeigt NUR, ob die relevanten Keys existieren/leer sind.
+    KEINE Werte (Token wird niemals geloggt).
+    """
+    keys = [
+        "WECLAPP_BASE_URL", "WECLAPP_API_BASE_URL", "WECLAPP_URL", "WECLAPP_BASEURL",
+        "WECLAPP_API_TOKEN", "WECLAPP_TOKEN", "WECLAPP_AUTH_TOKEN", "WECLAPP_AUTHENTICATIONTOKEN", "AUTHENTICATIONTOKEN",
+    ]
+    present = []
+    for k in keys:
+        v = os.getenv(k)
+        if v is None:
+            present.append(f"{k}=<missing>")
+        else:
+            present.append(f"{k}={'<set>' if str(v).strip() else '<empty>'}")
+    print("[WECLAPP][ENV_KEYS] " + " | ".join(present))
+    print("[WECLAPP] base_url_set:", bool(weclapp_base_url()), "token_set:", bool(weclapp_token()), "base_url:", weclapp_base_url())
+
 def weclapp_check_company() -> tuple[bool, str]:
-    """
-    Prüft, ob Weclapp erreichbar ist und Token stimmt.
-    Nutzt GET /company.
-    """
     if not weclapp_configured():
-        # Keine ENV-Details im UI – nur klarer Hinweis
         return False, "nicht verbunden"
 
     if requests is None:
         return False, "requests fehlt (Package). Bitte 'requests' in requirements.txt aufnehmen."
 
     url = weclapp_base_url().rstrip("/") + "/company"
-
     try:
         r = requests.get(url, headers=weclapp_headers(), timeout=15)
-
-        # Häufigste Auth-Fehler sauber benennen
         if r.status_code in (401, 403):
-            return False, f"verbunden, aber Token ungültig (HTTP {r.status_code})"
-
+            return False, f"Token ungültig/keine Rechte (HTTP {r.status_code})"
         if r.status_code < 300:
             return True, "verbunden"
-        return False, f"verbunden, aber API-Fehler (HTTP {r.status_code})"
+        return False, f"API-Fehler (HTTP {r.status_code})"
     except Exception as e:
-        return False, f"verbunden, aber Verbindung fehlgeschlagen: {str(e)}"
-
-# Optional (Debug ohne Token-Leak): nur Server-Logs
-def log_weclapp_env_state():
-    try:
-        base = weclapp_base_url()
-        tok = weclapp_token()
-        print("[WECLAPP] base_url_set:", bool(base), "token_set:", bool(tok), "base_url:", base)
-    except Exception:
-        pass
+        return False, f"Verbindung fehlgeschlagen: {str(e)}"
 
 # ============================================================
 # HELPER
@@ -325,7 +288,7 @@ def looks_like_cash_booking(konto_text, amount):
     return False
 
 # ============================================================
-# KPI / USt & Betriebsergebnis
+# KPI / USt & Betriebsergebnis (unverändert)
 # ============================================================
 
 def classify_direction_by_partnerkonto(gp_konto: str) -> str:
@@ -528,7 +491,6 @@ def compute_vat_net_kpi(belege: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
 def run_analysis():
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    # ------------------ Kontoauszug ------------------
     konto = safe_read_csv(KONTOAUSZUG_CSV, sep=";")
 
     amount_col = find_column(
@@ -551,7 +513,6 @@ def run_analysis():
     )
     konto["konto_index"] = konto.index
 
-    # ------------------ Belege ------------------
     belege = safe_read_csv(BELEGE_CSV, sep=";")
 
     beleg_amount_col = find_column(
@@ -582,7 +543,6 @@ def run_analysis():
     invoice_main_col = find_column(belege, ["rechnungs-nr.", "rechnungsnummer"], default=None, prefer_contains="rechnungs")
     belege["invoice_number"] = belege[invoice_main_col] if invoice_main_col else ""
 
-    # Status
     status_col = find_column(belege, ["gebucht", "status", "belegstatus", "buchungsstatus"], default=None)
     if (not status_col) and STATUS_SPALTE_MANUELL and STATUS_SPALTE_MANUELL in belege.columns:
         status_col = STATUS_SPALTE_MANUELL
@@ -595,15 +555,12 @@ def run_analysis():
         belege["ist_gebucht"] = True
         belege["ist_posteingang"] = False
 
-    # KPI
     belege, kpi_res = compute_vat_net_kpi(belege)
 
-    # ------------------ Matching ------------------
     sichere_matches = []
     unklare_map = {}
     verwendete_konto_indices = set()
 
-    # 1) Gebuchte
     gebuchte = belege[belege["ist_gebucht"] == True].copy()
     for _, beleg in gebuchte.iterrows():
         betrag = beleg.get("betrag_raw", np.nan)
@@ -665,7 +622,6 @@ def run_analysis():
                     "score": c["score"],
                 })
 
-    # 2) Posteingang
     posteingang = belege[belege["ist_posteingang"] == True].copy()
     for _, beleg in posteingang.iterrows():
         betrag = beleg.get("betrag_raw", np.nan)
@@ -729,7 +685,6 @@ def run_analysis():
                 "beleg_rechnungsnr": inv_nr,
             })
 
-    # Unklare zusammenfassen
     unklare_faelle = []
     for _, data in unklare_map.items():
         kandidaten = data["kandidaten"]
@@ -758,7 +713,6 @@ def run_analysis():
             "konto_indices_scores": konto_scores_str,
         })
 
-    # Konto ohne Beleg / Kasse
     alle_verwendeten_konto = {m["konto_index"] for m in sichere_matches}
     for data in unklare_map.values():
         for k in data["kandidaten"]:
@@ -770,7 +724,6 @@ def run_analysis():
         axis=1
     )
 
-    # Vorschläge Posteingang
     vorschlaege = []
     for _, beleg in posteingang.iterrows():
         betrag = beleg.get("betrag_raw", np.nan)
@@ -810,7 +763,6 @@ def run_analysis():
                 "score": c["score"],
             })
 
-    # Outputs
     df_sicher = pd.DataFrame(sichere_matches)
     df_unklar = pd.DataFrame(unklare_faelle)
 
@@ -829,16 +781,13 @@ def run_analysis():
     if vorschlaege:
         pd.DataFrame(vorschlaege).to_csv(OUTPUT_DIR / "posteingang_kandidaten.csv", sep=";", index=False, encoding="utf-8-sig")
 
-    # Summary
     anzahl_sicher = len(df_sicher)
     anzahl_sicher_gebucht = len(df_sicher[df_sicher["typ"] == "gebucht"]) if not df_sicher.empty else 0
     anzahl_sicher_post = len(df_sicher[df_sicher["typ"] == "posteingang"]) if not df_sicher.empty else 0
-
     anzahl_unklar = len(df_unklar)
     anzahl_fehlende = len(konto_ohne_beleg)
     anzahl_kasse = int(konto_ohne_beleg["ist_kasse_vermutet"].sum()) if not konto_ohne_beleg.empty else 0
 
-    # Weclapp Status als CSV (kommt in ZIP)
     ok, msg = weclapp_check_company()
     pd.DataFrame([{
         "configured_env": weclapp_configured(),
@@ -872,8 +821,8 @@ def format_eur(x) -> str:
 
 @app.get("/", response_class=HTMLResponse)
 def index():
-    # optional: Server-Log hilft dir auf Railway sofort zu sehen, ob ENV wirklich ankommt
-    log_weclapp_env_state()
+    # Debug in Logs (ohne Token zu leaken)
+    log_env_keys()
 
     ok, msg = weclapp_check_company()
     status_badge = "✅ " + msg if ok else "⚠️ " + msg
@@ -900,7 +849,6 @@ def index():
           .filename {{ font-weight:600; margin-top:6px; }}
           .file-input {{ display:none; }}
 
-          /* Buttons */
           button {{ padding:10px 18px; font-size:16px; border-radius:8px; border:none; color:white; cursor:pointer; }}
           button:disabled {{ opacity:0.7; cursor:not-allowed; }}
 
@@ -924,8 +872,8 @@ def index():
         <h1>Business Finance AI</h1>
         <p class="hint">
 Willkommen bei deiner NEXTWAVE Business Finance AI!<br><br>
-1) Zeitraum auswählen – automatische USt-Analyse über Weclapp.<br>
-2) Kontoauszug + DATEV-Belege hochladen – Belegabgleich inkl. Excel-Export.<br>
+1) Zeitraum auswählen – USt-Check über Weclapp.<br>
+2) Kontoauszug + DATEV-Belege hochladen – Abgleich inkl. Excel-Export.<br>
         </p>
 
         <div class="box">
@@ -945,7 +893,6 @@ Willkommen bei deiner NEXTWAVE Business Finance AI!<br><br>
             <strong>Weclapp:</strong> {status_badge}
           </div>
 
-          <!-- ✅ Button direkt UNTER Zeitraum -->
           <form id="weclappForm" action="/weclapp-ust" method="post" style="margin-top:12px;">
             <input type="hidden" name="date_from" id="wf_from" value="{default_from}">
             <input type="hidden" name="date_to" id="wf_to" value="{default_to}">
@@ -975,7 +922,6 @@ Willkommen bei deiner NEXTWAVE Business Finance AI!<br><br>
               <input class="file-input" type="file" name="belege_file" id="belege_file" accept=".csv" required />
             </div>
 
-            <!-- ✅ Orange (nicht mehr blau) -->
             <button type="submit" id="submitBtn" class="btn-orange">DATEV Analyse starten</button>
             <div id="progress" class="progress"><div class="spinner"></div><span>Analyse läuft …</span></div>
           </form>
@@ -1062,10 +1008,6 @@ Willkommen bei deiner NEXTWAVE Business Finance AI!<br><br>
 
 @app.post("/weclapp-ust", response_class=HTMLResponse)
 async def weclapp_ust(date_from: str = Form(""), date_to: str = Form("")):
-    """
-    Button unter Zeitraum: macht einen API/Auth-Check und legt weclapp_status.csv ab.
-    (Echte USt-Berechnung über Weclapp-Objekte/Endpoints kommt als nächster Schritt.)
-    """
     ok, msg = weclapp_check_company()
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -1120,7 +1062,6 @@ async def run(konto_file: UploadFile = File(...), belege_file: UploadFile = File
 
     res = run_analysis()
 
-    # ZIP bauen
     zip_path = OUTPUT_DIR / "datev_analyse_ergebnisse.zip"
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
         for csv_file in OUTPUT_DIR.glob("*.csv"):
@@ -1158,7 +1099,6 @@ async def run(konto_file: UploadFile = File(...), belege_file: UploadFile = File
         <div class="box">
           <h2>USt &amp; Betriebsergebnis (Quartal)</h2>
           <p style="color:#374151; margin-top:0;">
-            KPI basiert auf DATEV-Logik (BU/Konto), ignoriert USD und Reverse-Charge/Ausland.<br>
             Details in der ZIP: <code>ust_betriebsergebnis.csv</code>, <code>ust_methoden_stats.csv</code>, <code>kpi_offen.csv</code>, <code>kpi_ignoriert.csv</code>.
           </p>
           <ul>
@@ -1168,13 +1108,6 @@ async def run(konto_file: UploadFile = File(...), belege_file: UploadFile = File
             <li><strong>Umsatz netto:</strong> {format_eur(res.get('umsatz_netto',0))}</li>
             <li><strong>Kosten netto:</strong> {format_eur(res.get('kosten_netto',0))}</li>
             <li><strong>Betriebsergebnis:</strong> {format_eur(res.get('betriebsergebnis',0))}</li>
-            <li><strong>Abdeckung (berechnet):</strong>
-              Ausgang {res.get('ausgang_covered_kpi',0)}/{res.get('ausgang_total_kpi',0)},
-              Eingang {res.get('eingang_covered_kpi',0)}/{res.get('eingang_total_kpi',0)}
-            </li>
-            <li><strong>Ignoriert (KPI):</strong> {res.get('ignored_total',0)} Belege
-              (USD: {res.get('ignored_usd',0)}, RC/Ausland: {res.get('ignored_rc',0)})</li>
-            <li><strong>Brutto ignoriert:</strong> {format_eur(res.get('brutto_ignored',0))}</li>
           </ul>
         </div>
 
@@ -1212,6 +1145,5 @@ def logo():
     return FileResponse(BASE_DIR / "nextwave_logo.png", media_type="image/png")
 
 if __name__ == "__main__":
-    # Railway braucht i.d.R. 0.0.0.0 und PORT aus ENV
     port = int(os.getenv("PORT", "8000"))
     uvicorn.run(app, host="0.0.0.0", port=port)
