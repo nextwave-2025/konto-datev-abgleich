@@ -5,17 +5,16 @@ from datetime import datetime, date
 import re
 import os
 import zipfile
-import requests
+from typing import Optional
 
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.responses import HTMLResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 import uvicorn
 
-# ============================================================
-# KONFIGURATION
-# ============================================================
-
+# =========================
+# KONFIG
+# =========================
 BASE_DIR = Path(__file__).parent
 
 KONTOAUSZUG_CSV = BASE_DIR / "kontoauszug.csv"
@@ -28,21 +27,34 @@ BETRAG_TOLERANZ = 0.01
 DATUM_FENSTER_TAGE = 30
 STATUS_SPALTE_MANUELL = None
 
+PRIMARY_COLOR = "#f15124"  # <-- gewünschte Farbe
+
 # Weclapp ENV
-WECLAPP_BASE_URL = os.getenv("WECLAPP_BASE_URL", "").rstrip("/")  # z.B. https://nextwave.weclapp.com
+WECLAPP_BASE_URL = os.getenv("WECLAPP_BASE_URL", "").rstrip("/")
 WECLAPP_API_TOKEN = os.getenv("WECLAPP_API_TOKEN", "").strip()
 
-# ============================================================
-# FASTAPI
-# ============================================================
+# requests optional import (damit App nicht crasht, falls deps fehlen)
+try:
+    import requests  # type: ignore
+except Exception:
+    requests = None  # type: ignore
 
+
+# =========================
+# FASTAPI
+# =========================
 app = FastAPI()
 app.mount("/static", StaticFiles(directory=BASE_DIR), name="static")
 
-# ============================================================
-# HELPER (CSV / Normalisierung / Matching)
-# ============================================================
 
+@app.get("/health")
+def health():
+    return {"ok": True}
+
+
+# =========================
+# HELPERS (CSV / NORMALIZE)
+# =========================
 def safe_read_csv(path: Path, sep=";") -> pd.DataFrame:
     for enc in ("utf-8-sig", "utf-8", "latin1"):
         try:
@@ -148,6 +160,7 @@ def make_invoice_variants(inv_clean: str) -> set[str]:
         if len(no_prefix) >= n:
             variants.add(no_prefix[-n:])
 
+    # robust, aber nicht zu kurz
     variants = {v for v in variants if len(v) >= 6}
     return variants
 
@@ -193,10 +206,10 @@ def looks_like_cash_booking(konto_text, amount):
         return abs(amt) <= 300
     return False
 
-# ============================================================
-# INVOICE-FIRST INDEX (Belege.csv -> Variantenindex)
-# ============================================================
 
+# =========================
+# INVOICE-FIRST INDEX
+# =========================
 def build_invoice_index(belege: pd.DataFrame) -> dict[str, list[int]]:
     idx: dict[str, list[int]] = {}
 
@@ -231,7 +244,6 @@ def find_invoices_in_konto_text(konto_text: str, invoice_index: dict[str, list[i
         return hits
 
     chunks = re.findall(r"[0-9a-z]{6,}", text_norm)
-
     for ch in chunks:
         if ch in invoice_index:
             hits.update(invoice_index[ch])
@@ -248,21 +260,19 @@ def find_invoices_in_konto_text(konto_text: str, invoice_index: dict[str, list[i
 
     return hits
 
-# ============================================================
-# WECLAPP: USt Status für Zeitraum
-# ============================================================
 
+# =========================
+# WECLAPP UST
+# =========================
 def _parse_iso_date(s: str) -> date:
     s = (s or "").strip()
     return datetime.strptime(s, "%Y-%m-%d").date()
 
 def weclapp_enabled() -> bool:
-    return bool(WECLAPP_BASE_URL and WECLAPP_API_TOKEN)
+    return bool(WECLAPP_BASE_URL and WECLAPP_API_TOKEN and requests is not None)
 
 def weclapp_headers() -> dict:
-    # Weclapp nutzt API-Token im Header (üblich: Authentication oder X-...).
-    # Da Tenant-Setups variieren, unterstützen wir mehrere Varianten.
-    # (Wenn es bei dir nicht greift, sag mir kurz den Header-Namen aus deinem Setup.)
+    # Mehrere Varianten, da Tenant-Setups unterschiedlich sein können
     return {
         "AuthenticationToken": WECLAPP_API_TOKEN,
         "Authorization": f"Bearer {WECLAPP_API_TOKEN}",
@@ -270,21 +280,21 @@ def weclapp_headers() -> dict:
     }
 
 def weclapp_get_all(entity: str, filters: dict, page_size: int = 500) -> list[dict]:
-    """
-    Lädt paginiert. Weclapp API v1-style: /webapp/api/v1/{entity}
-    Filter Syntax: property-operator=value, z.B. invoiceDate-ge=2025-10-01 :contentReference[oaicite:1]{index=1}
-    """
+    if requests is None:
+        raise RuntimeError("requests ist nicht installiert")
+
     base = f"{WECLAPP_BASE_URL}/webapp/api/v1/{entity}"
     params = {"pageSize": page_size, **filters}
     out = []
     page = 1
+
     while True:
         params["page"] = page
-        r = requests.get(base, headers=weclapp_headers(), params=params, timeout=30)
+        r = requests.get(base, headers=weclapp_headers(), params=params, timeout=30)  # type: ignore
         if r.status_code >= 400:
             raise RuntimeError(f"Weclapp API Fehler {r.status_code} bei {entity}: {r.text[:500]}")
         data = r.json()
-        # Weclapp liefert meist { "result": [...], "page":..., "pageSize":..., "totalPages":... }
+
         if isinstance(data, dict) and "result" in data:
             batch = data.get("result") or []
             out.extend(batch)
@@ -298,9 +308,11 @@ def weclapp_get_all(entity: str, filters: dict, page_size: int = 500) -> list[di
             break
         else:
             break
+
         page += 1
         if page > 2000:
             break
+
     return out
 
 def pick_first(d: dict, keys: list[str], default=None):
@@ -323,31 +335,40 @@ def to_float_safe(x):
 def summarize_weclapp_vat(period_from: str, period_to: str) -> dict:
     """
     Summiert:
-    - Vorsteuer: aus purchaseInvoice (fallback: purchaseOrder)
-    - Umsatzsteuer: aus salesInvoice
-    Und erstellt Details als Excel in output/.
+    - Umsatzsteuer: salesInvoice
+    - Vorsteuer: purchaseInvoice / incomingInvoice (fallback purchaseOrder)
+    Export: weclapp_ust_details.xlsx (im OUTPUT_DIR)
     """
     if not weclapp_enabled():
+        reason = []
+        if requests is None:
+            reason.append("requests fehlt")
+        if not WECLAPP_BASE_URL:
+            reason.append("WECLAPP_BASE_URL fehlt")
+        if not WECLAPP_API_TOKEN:
+            reason.append("WECLAPP_API_TOKEN fehlt")
         return {
             "enabled": False,
-            "error": "Weclapp ist nicht konfiguriert (WECLAPP_BASE_URL / WECLAPP_API_TOKEN fehlen).",
+            "error": "Weclapp nicht konfiguriert: " + ", ".join(reason),
             "vorsteuer_sum": 0.0,
             "umsatzsteuer_sum": 0.0,
             "saldo": 0.0,
             "status": "Unbekannt",
             "details_file": "",
+            "sales_count": 0,
+            "purchase_count": 0,
+            "purchase_entity_used": "",
         }
 
-    d_from = _parse_iso_date(period_from)
-    d_to = _parse_iso_date(period_to)
+    _ = _parse_iso_date(period_from)
+    _ = _parse_iso_date(period_to)
 
-    # Filterfelder – je nach Entity heißen Datumsfelder anders. Wir versuchen robust mehrere.
-    # 1) Sales Invoices
     sales_filters_candidates = [
         {"invoiceDate-ge": period_from, "invoiceDate-le": period_to},
         {"createdDate-ge": period_from, "createdDate-le": period_to},
         {"dueDate-ge": period_from, "dueDate-le": period_to},
     ]
+
     sales_docs = []
     last_sales_err = None
     for f in sales_filters_candidates:
@@ -358,9 +379,9 @@ def summarize_weclapp_vat(period_from: str, period_to: str) -> dict:
         except Exception as e:
             last_sales_err = str(e)
 
-    # 2) Purchase Invoices (Fallback purchaseOrder)
     purchase_docs = []
     last_purchase_err = None
+    purchase_entity_used = ""
 
     purchase_entity_try = ["purchaseInvoice", "incomingInvoice", "purchaseOrder"]
     purchase_filters_candidates = [
@@ -369,24 +390,20 @@ def summarize_weclapp_vat(period_from: str, period_to: str) -> dict:
         {"orderDate-ge": period_from, "orderDate-le": period_to},
     ]
 
+    ok = False
     for ent in purchase_entity_try:
         for f in purchase_filters_candidates:
             try:
                 purchase_docs = weclapp_get_all(ent, f)
                 last_purchase_err = None
                 purchase_entity_used = ent
-                raise StopIteration
-            except StopIteration:
+                ok = True
                 break
             except Exception as e:
                 last_purchase_err = str(e)
-        else:
-            continue
-        break
-    else:
-        purchase_entity_used = "purchaseInvoice"
+        if ok:
+            break
 
-    # Summierung: wir versuchen typische Tax-Felder (robust)
     def extract_tax_amount(doc: dict, direction: str) -> float:
         if direction == "sales":  # Umsatzsteuer
             return to_float_safe(pick_first(doc, [
@@ -418,12 +435,10 @@ def summarize_weclapp_vat(period_from: str, period_to: str) -> dict:
         ], ""))
 
     def extract_partner(doc: dict) -> str:
-        # Kunde/Lieferant
         return str(pick_first(doc, [
             "customerName", "supplierName", "customer", "supplier", "businessPartnerName"
         ], ""))
 
-    # Details DataFrames
     sales_rows = []
     for doc in sales_docs:
         sales_rows.append({
@@ -441,7 +456,7 @@ def summarize_weclapp_vat(period_from: str, period_to: str) -> dict:
     purchase_rows = []
     for doc in purchase_docs:
         purchase_rows.append({
-            "type": purchase_entity_used,
+            "type": purchase_entity_used or "purchaseInvoice",
             "date": extract_doc_date(doc),
             "number": extract_number(doc),
             "partner": extract_partner(doc),
@@ -463,7 +478,6 @@ def summarize_weclapp_vat(period_from: str, period_to: str) -> dict:
     else:
         status = "Ausgeglichen"
 
-    # Excel Export
     details_xlsx = OUTPUT_DIR / "weclapp_ust_details.xlsx"
     with pd.ExcelWriter(details_xlsx, engine="openpyxl") as writer:
         df_sales.to_excel(writer, index=False, sheet_name="Umsatzsteuer (Sales)")
@@ -489,7 +503,7 @@ def summarize_weclapp_vat(period_from: str, period_to: str) -> dict:
         "umsatzsteuer_sum": round(umsatzsteuer_sum, 2),
         "saldo": round(saldo, 2),
         "status": status,
-        "details_file": str(details_xlsx.name),
+        "details_file": details_xlsx.name,
         "sales_count": int(len(df_sales)),
         "purchase_count": int(len(df_purchase)),
         "purchase_entity_used": purchase_entity_used,
@@ -497,11 +511,11 @@ def summarize_weclapp_vat(period_from: str, period_to: str) -> dict:
         "purchase_error_last": last_purchase_err or "",
     }
 
-# ============================================================
-# HAUPTLOGIK: Matching + Weclapp Status
-# ============================================================
 
-def run_analysis(period_from: str, period_to: str):
+# =========================
+# DATEV MATCHING (CSV)
+# =========================
+def run_datev_matching():
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     konto = safe_read_csv(KONTOAUSZUG_CSV, sep=";")
@@ -543,12 +557,15 @@ def run_analysis(period_from: str, period_to: str):
     else:
         belege["datum_norm"] = pd.NaT
 
-    supplier_cols = [c for c in belege.columns if any(k in c.lower() for k in ["lieferant", "name", "adressat", "empfänger", "kunde", "geschäftspartner-name", "geschaeftspartner-name"])]
-    invoice_cols = [c for c in belege.columns if any(k in c.lower() for k in ["rechnungsnummer", "rechnungs-nr", "belegfeld 1", "belegfeld1", "interne re"])]
+    supplier_cols = [c for c in belege.columns if any(k in c.lower() for k in [
+        "lieferant", "name", "adressat", "empfänger", "kunde", "geschäftspartner-name", "geschaeftspartner-name"
+    ])]
+    invoice_cols = [c for c in belege.columns if any(k in c.lower() for k in [
+        "rechnungsnummer", "rechnungs-nr", "belegfeld 1", "belegfeld1", "interne re"
+    ])]
 
     belege["supplier_text"] = belege.apply(lambda row: extract_supplier_text(row, supplier_cols, invoice_cols), axis=1)
 
-    # Status
     status_col = find_column(belege, ["status", "verarbeitungsstatus", "belegstatus", "buchungsstatus", "gebucht"], default=None)
     if (not status_col) and STATUS_SPALTE_MANUELL and STATUS_SPALTE_MANUELL in belege.columns:
         status_col = STATUS_SPALTE_MANUELL
@@ -561,14 +578,13 @@ def run_analysis(period_from: str, period_to: str):
         belege["ist_gebucht"] = True
         belege["ist_posteingang"] = False
 
-    # Invoice Index
     invoice_index = build_invoice_index(belege)
 
     sichere_matches = []
     unklare_map = {}
     verwendete_konto_indices = set()
 
-    # A) Invoice-first (Konto -> Beleg)
+    # 1) Invoice-first (Rechnungsnummer im Konto-Text => sofort sicher)
     invoice_hits_rows = []
     for _, krow in konto.iterrows():
         kidx = int(krow["konto_index"])
@@ -628,7 +644,6 @@ def run_analysis(period_from: str, period_to: str):
     else:
         (OUTPUT_DIR / "invoice_text_matches.csv").write_text("keine invoice-text matches gefunden", encoding="utf-8")
 
-    # B) Beleg -> Konto (Betrag/Datum/Score) nur für nicht belegte Kontozeilen
     def add_unklar(beleg, typ, candidates):
         entry = unklare_map.setdefault(
             int(beleg.name),
@@ -651,7 +666,7 @@ def run_analysis(period_from: str, period_to: str):
                 "score": c["score"],
             })
 
-    # Gebuchte
+    # 2) Gebuchte Belege -> Konto
     gebuchte = belege[belege["ist_gebucht"] == True].copy()
     for _, beleg in gebuchte.iterrows():
         betrag = beleg.get("betrag_raw", np.nan)
@@ -700,7 +715,7 @@ def run_analysis(period_from: str, period_to: str):
         else:
             add_unklar(beleg, "gebucht", candidates)
 
-    # Posteingang
+    # 3) Posteingang -> Konto
     posteingang = belege[belege["ist_posteingang"] == True].copy()
     for _, beleg in posteingang.iterrows():
         betrag = beleg.get("betrag_raw", np.nan)
@@ -751,7 +766,7 @@ def run_analysis(period_from: str, period_to: str):
             "beleg_rechnungsnr": beleg.get("invoice_number", ""),
         })
 
-    # Unklare zusammenfassen
+    # Unklar zusammenfassen
     unklare_faelle = []
     for _, data in unklare_map.items():
         kandidaten = data.get("kandidaten", [])
@@ -791,7 +806,7 @@ def run_analysis(period_from: str, period_to: str):
         axis=1
     )
 
-    # Export CSV
+    # Export
     df_sicher = pd.DataFrame(sichere_matches)
     df_unklar = pd.DataFrame(unklare_faelle)
 
@@ -805,45 +820,67 @@ def run_analysis(period_from: str, period_to: str):
 
     konto_ohne_beleg.to_csv(OUTPUT_DIR / "konto_ohne_beleg.csv", sep=";", index=False, encoding="utf-8-sig")
 
-    # WECLAPP USt Status
-    weclapp_res = summarize_weclapp_vat(period_from, period_to)
-
     return {
         "anzahl_sicher": len(df_sicher),
-        "anzahl_sicher_gebucht": int((~df_sicher.empty) and (df_sicher["typ"] == "gebucht").sum()) if not df_sicher.empty else 0,
-        "anzahl_sicher_post": int((~df_sicher.empty) and (df_sicher["typ"] == "posteingang").sum()) if not df_sicher.empty else 0,
-        "anzahl_sicher_invoice": int((~df_sicher.empty) and (df_sicher["typ"] == "invoice_text").sum()) if not df_sicher.empty else 0,
+        "anzahl_sicher_gebucht": int((df_sicher["typ"] == "gebucht").sum()) if not df_sicher.empty else 0,
+        "anzahl_sicher_post": int((df_sicher["typ"] == "posteingang").sum()) if not df_sicher.empty else 0,
+        "anzahl_sicher_invoice": int((df_sicher["typ"] == "invoice_text").sum()) if not df_sicher.empty else 0,
         "anzahl_unklar": len(df_unklar),
         "anzahl_fehlende": len(konto_ohne_beleg),
         "anzahl_kasse": int(konto_ohne_beleg["ist_kasse_vermutet"].sum()) if not konto_ohne_beleg.empty else 0,
-        "period_from": period_from,
-        "period_to": period_to,
-        "weclapp": weclapp_res,
     }
 
-# ============================================================
-# WEB UI
-# ============================================================
 
+# =========================
+# UI
+# =========================
 @app.get("/", response_class=HTMLResponse)
 def index():
-    # Zeitraum UI: Standard = leer (User setzt), JS kann default last quarter setzen
+    status_badge = "aktiv" if weclapp_enabled() else "nicht konfiguriert"
     return f"""
     <html>
       <head>
         <title>NEXTWAVE AI Buchhaltung</title>
         <style>
+          :root {{
+            --primary: {PRIMARY_COLOR};
+            --primaryHover: #d9451f;
+          }}
           body {{
             font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-            max-width: 900px;
+            max-width: 980px;
             margin: 40px auto;
             padding: 0 16px;
           }}
           h1 {{ margin-bottom: 0.5rem; }}
           .logo {{ max-width: 260px; height: auto; margin-bottom: 10px; display: block; }}
           .hint {{ color: #555; margin-bottom: 1.2rem; line-height: 1.5; }}
-          .field {{ margin-bottom: 1.2rem; }}
+          .badge {{
+            display:inline-block; padding: 4px 10px; border-radius: 999px;
+            background:#f3f4f6; color:#111827; font-size: 12px;
+            border: 1px solid #e5e7eb;
+          }}
+          .box {{
+            border:1px solid #e5e7eb; border-radius: 10px;
+            padding: 12px; background: #fafafa; margin: 12px 0;
+          }}
+          .row {{
+            display:flex; gap:14px; align-items:flex-end; flex-wrap: wrap;
+          }}
+          .field {{ margin-bottom: 1.2rem; flex: 1; min-width: 220px; }}
           .label {{ display: block; margin-bottom: 0.25rem; font-weight: 600; }}
+          input[type="date"] {{
+            padding: 10px;
+            border-radius: 8px;
+            border: 1px solid #d1d5db;
+            min-width: 220px;
+            font-size: 14px;
+            outline: none;
+          }}
+          input[type="date"]:focus {{
+            border-color: var(--primary);
+            box-shadow: 0 0 0 3px rgba(241,81,36,0.18);
+          }}
           .dropzone {{
             border: 2px dashed #999;
             border-radius: 8px;
@@ -852,32 +889,38 @@ def index():
             cursor: pointer;
             transition: border-color 0.2s, background-color 0.2s;
           }}
-          .dropzone.hover {{ border-color: #2563eb; background-color: #eff6ff; }}
+          .dropzone.hover {{
+            border-color: var(--primary);
+            background-color: rgba(241,81,36,0.06);
+          }}
           .filename {{ font-weight: 600; margin-top: 6px; }}
           .file-input {{ display: none; }}
-          .row {{
-            display:flex; gap:14px; align-items:flex-end; flex-wrap: wrap;
-            border: 1px solid #e5e7eb; border-radius: 10px; padding: 12px; background: #fafafa;
-            margin-bottom: 14px;
-          }}
-          .row .field {{ margin: 0; }}
-          input[type="date"] {{
-            padding: 10px; border-radius: 8px; border:1px solid #d1d5db; min-width: 200px;
+
+          .btnrow {{
+            display:flex; gap:10px; flex-wrap: wrap; align-items:center;
+            margin-top: 8px;
           }}
           button {{
-            padding: 10px 20px;
+            padding: 10px 18px;
             font-size: 16px;
-            border-radius: 6px;
+            border-radius: 8px;
             border: none;
-            background-color: #2563eb;
+            background-color: var(--primary);
             color: white;
             cursor: pointer;
           }}
-          button:hover {{ background-color: #1d4ed8; }}
+          button:hover {{ background-color: var(--primaryHover); }}
+          button.secondary {{
+            background-color: #111827;
+          }}
+          button.secondary:hover {{
+            background-color: #000;
+          }}
+
           .progress {{
             margin-top: 1rem;
-            font-size: 0.9rem;
-            color: #2563eb;
+            font-size: 0.95rem;
+            color: var(--primary);
             display: none;
             align-items: center;
             gap: 8px;
@@ -888,64 +931,80 @@ def index():
             height: 18px;
             border-radius: 999px;
             border: 3px solid #e5e7eb;
-            border-top-color: #2563eb;
+            border-top-color: var(--primary);
             animation: spin 0.8s linear infinite;
           }}
-          @keyframes spin {{ from {{ transform: rotate(0deg); }} to {{ transform: rotate(360deg); }} }}
+          @keyframes spin {{
+            from {{ transform: rotate(0deg); }}
+            to   {{ transform: rotate(360deg); }}
+          }}
           .legal {{
             margin-top: 1.2rem;
             font-size: 0.75rem;
             color: #777;
             line-height: 1.4;
           }}
-          .badge {{
-            display:inline-block; padding: 4px 10px; border-radius: 999px; background:#e5e7eb; color:#111827; font-size: 12px;
+          .note {{
+            font-size: 0.9rem;
+            color: #374151;
+            margin-top: 6px;
           }}
         </style>
       </head>
+
       <body>
         <img src="/logo.png" alt="NEXTWAVE Logo" class="logo" />
         <h1>DATEV Kontoauszug / Belege Analyse</h1>
 
         <p class="hint">
-          1) CSVs hochladen (Kontoauszug &amp; Belege).<br>
-          2) Zeitraum wählen (z. B. Quartal).<br>
-          3) Analyse starten → Matching + Weclapp USt-Status (Vorsteuer vs. Umsatzsteuer).<br>
-          <span class="badge">Weclapp: {"aktiv" if weclapp_enabled() else "nicht konfiguriert"}</span>
+          1) Zeitraum wählen (z. B. Quartal).<br>
+          2) Optional DATEV CSVs hochladen (Kontoauszug &amp; Belege).<br>
+          3) Entweder nur Weclapp USt-Status berechnen <b>oder</b> DATEV Matching + ZIP exportieren.<br>
+          <span class="badge">Weclapp: {status_badge}</span>
         </p>
 
-        <form id="uploadForm" action="/run" method="post" enctype="multipart/form-data">
-
-          <div class="row">
-            <div class="field">
-              <span class="label">Zeitraum von</span>
-              <input type="date" name="period_from" id="period_from" required />
+        <form id="mainForm" action="/run" method="post" enctype="multipart/form-data">
+          <div class="box">
+            <div class="row">
+              <div class="field">
+                <span class="label">Zeitraum von</span>
+                <input type="date" name="period_from" id="period_from" required />
+              </div>
+              <div class="field">
+                <span class="label">Zeitraum bis</span>
+                <input type="date" name="period_to" id="period_to" required />
+              </div>
             </div>
-            <div class="field">
-              <span class="label">Zeitraum bis</span>
-              <input type="date" name="period_to" id="period_to" required />
+            <div class="note">
+              Tipp: Standard wird automatisch auf das letzte Quartal gesetzt.
             </div>
           </div>
 
           <div class="field">
-            <span class="label">Kontoauszug CSV</span>
+            <span class="label">Kontoauszug CSV (nur für DATEV Matching)</span>
             <div id="konto_drop" class="dropzone">
               <div>CSV hierhin ziehen oder klicken</div>
               <div class="filename" id="konto_filename">Keine Datei ausgewählt</div>
             </div>
-            <input class="file-input" type="file" name="konto_file" id="konto_file" accept=".csv" required />
+            <input class="file-input" type="file" name="konto_file" id="konto_file" accept=".csv" />
           </div>
 
           <div class="field">
-            <span class="label">Belege CSV</span>
+            <span class="label">Belege CSV (nur für DATEV Matching)</span>
             <div id="belege_drop" class="dropzone">
               <div>CSV hierhin ziehen oder klicken</div>
               <div class="filename" id="belege_filename">Keine Datei ausgewählt</div>
             </div>
-            <input class="file-input" type="file" name="belege_file" id="belege_file" accept=".csv" required />
+            <input class="file-input" type="file" name="belege_file" id="belege_file" accept=".csv" />
           </div>
 
-          <button type="submit" id="submitBtn">Analyse starten</button>
+          <input type="hidden" name="mode" id="mode" value="weclapp" />
+
+          <div class="btnrow">
+            <button type="submit" id="btnWeclapp">Weclapp USt-Status berechnen</button>
+            <button type="submit" class="secondary" id="btnDatev">DATEV Analyse starten (ZIP)</button>
+          </div>
+
           <div id="progress" class="progress">
             <div class="spinner"></div>
             <span>Analyse läuft …</span>
@@ -1002,11 +1061,9 @@ def index():
 
             const now = new Date();
             const y = now.getFullYear();
-            const m = now.getMonth() + 1; // 1-12
+            const m = now.getMonth() + 1;
 
-            // Current quarter (1..4)
             const q = Math.floor((m - 1) / 3) + 1;
-            // Last quarter
             let lq = q - 1;
             let ly = y;
             if (lq === 0) {{ lq = 4; ly = y - 1; }}
@@ -1017,8 +1074,7 @@ def index():
             const pad = (n) => String(n).padStart(2, '0');
             const start = `${{ly}}-${{pad(startMonth)}}-01`;
 
-            // Last day of endMonth
-            const endDate = new Date(ly, endMonth, 0); // day 0 of next month
+            const endDate = new Date(ly, endMonth, 0);
             const end = `${{ly}}-${{pad(endMonth)}}-${{pad(endDate.getDate())}}`;
 
             fromEl.value = start;
@@ -1030,28 +1086,46 @@ def index():
             setupDropzone('belege_drop', 'belege_file', 'belege_filename');
             setLastQuarterDefaults();
 
-            const form = document.getElementById('uploadForm');
-            const submitBtn = document.getElementById('submitBtn');
+            const form = document.getElementById('mainForm');
+            const modeInput = document.getElementById('mode');
+
+            const btnWeclapp = document.getElementById('btnWeclapp');
+            const btnDatev = document.getElementById('btnDatev');
+
             const progress = document.getElementById('progress');
             const kontoInput = document.getElementById('konto_file');
             const belegeInput = document.getElementById('belege_file');
-            const pf = document.getElementById('period_from');
-            const pt = document.getElementById('period_to');
+
+            btnWeclapp.addEventListener('click', function() {{
+              modeInput.value = 'weclapp';
+            }});
+            btnDatev.addEventListener('click', function() {{
+              modeInput.value = 'datev';
+            }});
 
             form.addEventListener('submit', function(e) {{
-              if (!kontoInput.files.length || !belegeInput.files.length) {{
-                e.preventDefault();
-                alert('Bitte sowohl Kontoauszug-CSV als auch Belege-CSV auswählen.');
-                return;
-              }}
-              if (!pf.value || !pt.value) {{
+              const mode = modeInput.value;
+              const pf = document.getElementById('period_from').value;
+              const pt = document.getElementById('period_to').value;
+
+              if (!pf || !pt) {{
                 e.preventDefault();
                 alert('Bitte Zeitraum (von/bis) auswählen.');
                 return;
               }}
-              submitBtn.disabled = true;
-              submitBtn.textContent = 'Analyse läuft ...';
+
+              if (mode === 'datev') {{
+                if (!kontoInput.files.length || !belegeInput.files.length) {{
+                  e.preventDefault();
+                  alert('Für DATEV Analyse bitte sowohl Kontoauszug-CSV als auch Belege-CSV auswählen.');
+                  return;
+                }}
+              }}
+
+              // UI lock
               progress.classList.add('active');
+              btnWeclapp.disabled = true;
+              btnDatev.disabled = true;
             }});
           }});
         </script>
@@ -1059,54 +1133,115 @@ def index():
     </html>
     """
 
+
+# =========================
+# RUN (MODE: weclapp | datev)
+# =========================
 @app.post("/run", response_class=HTMLResponse)
 async def run(
-    konto_file: UploadFile = File(...),
-    belege_file: UploadFile = File(...),
+    mode: str = Form(...),
     period_from: str = Form(...),
-    period_to: str = Form(...)
+    period_to: str = Form(...),
+    konto_file: Optional[UploadFile] = File(None),
+    belege_file: Optional[UploadFile] = File(None),
 ):
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
+    # Immer Weclapp rechnen (wenn möglich) – für beide Modi
+    weclapp_res = summarize_weclapp_vat(period_from, period_to)
+
+    if mode == "weclapp":
+        # Nur Weclapp Ergebnis anzeigen + Excel-Download
+        w = weclapp_res
+        if not w.get("enabled"):
+            return f"""
+            <html><head><title>Weclapp USt-Status</title></head>
+            <body style="font-family:system-ui;max-width:900px;margin:40px auto;padding:0 16px;">
+              <h1>Weclapp USt-Status</h1>
+              <p style="color:#b91c1c;"><b>Weclapp nicht aktiv:</b> {w.get('error','')}</p>
+              <p><a href="/">Zurück</a></p>
+            </body></html>
+            """
+
+        return f"""
+        <html>
+          <head>
+            <title>Weclapp USt-Status</title>
+            <style>
+              :root {{ --primary:{PRIMARY_COLOR}; }}
+              body {{ font-family:system-ui;max-width:900px;margin:40px auto;padding:0 16px; }}
+              .box {{ border:1px solid #e5e7eb;border-radius:10px;padding:14px;background:#fafafa; }}
+              a.button {{
+                display:inline-block; margin-top: 14px; padding:10px 18px;
+                background: var(--primary); color:#fff; text-decoration:none; border-radius:8px;
+              }}
+              a.button:hover {{ opacity:0.9; }}
+            </style>
+          </head>
+          <body>
+            <h1>Weclapp USt-Status ({period_from} bis {period_to})</h1>
+            <div class="box">
+              <ul style="line-height:1.7;">
+                <li><b>Vorsteuer (Purchase):</b> {w.get('vorsteuer_sum',0):.2f} €</li>
+                <li><b>Umsatzsteuer (Sales):</b> {w.get('umsatzsteuer_sum',0):.2f} €</li>
+                <li><b>Saldo (Vorsteuer - Umsatzsteuer):</b> {w.get('saldo',0):.2f} €</li>
+                <li><b>Status:</b> {w.get('status','')}</li>
+                <li><b>Berücksichtigte Belege:</b> Sales {w.get('sales_count',0)}, Purchase {w.get('purchase_count',0)} (Entity: {w.get('purchase_entity_used','')})</li>
+              </ul>
+              <a class="button" href="/download-weclapp">Weclapp Excel herunterladen</a>
+            </div>
+            <p style="margin-top:14px;"><a href="/">Neue Abfrage</a></p>
+          </body>
+        </html>
+        """
+
+    # DATEV Modus
+    if mode != "datev":
+        return HTMLResponse("<h1>Ungültiger Modus</h1><p><a href='/'>Zurück</a></p>", status_code=400)
+
+    if konto_file is None or belege_file is None:
+        return HTMLResponse("<h1>Fehlende Dateien</h1><p>Bitte Kontoauszug & Belege hochladen.</p><p><a href='/'>Zurück</a></p>", status_code=400)
+
+    # Uploads speichern
     with open(KONTOAUSZUG_CSV, "wb") as f:
         f.write(await konto_file.read())
     with open(BELEGE_CSV, "wb") as f:
         f.write(await belege_file.read())
 
-    res = run_analysis(period_from, period_to)
+    # Matching
+    datev_res = run_datev_matching()
 
-    # ZIP bauen: alle CSVs + weclapp Excel
+    # ZIP bauen (CSV + weclapp excel)
     zip_path = OUTPUT_DIR / "datev_analyse_ergebnisse.zip"
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
         for p in OUTPUT_DIR.glob("*.csv"):
             zf.write(p, arcname=p.name)
-        for p in OUTPUT_DIR.glob("weclapp_ust_details.xlsx"):
-            zf.write(p, arcname=p.name)
+        # Weclapp Excel, falls vorhanden
+        wx = OUTPUT_DIR / "weclapp_ust_details.xlsx"
+        if wx.exists():
+            zf.write(wx, arcname=wx.name)
 
-    # Weclapp Summary
-    w = res.get("weclapp", {}) or {}
+    w = weclapp_res
     weclapp_html = ""
     if not w.get("enabled"):
         weclapp_html = f"""
-          <div class="box">
-            <h2>Weclapp USt-Status</h2>
-            <p style="color:#b91c1c;"><strong>Weclapp nicht aktiv:</strong> {w.get("error","")}</p>
-            <p style="color:#374151;">Tipp: ENV setzen: <code>WECLAPP_BASE_URL</code> &amp; <code>WECLAPP_API_TOKEN</code></p>
-          </div>
+        <div class="box">
+          <h2>Weclapp USt-Status</h2>
+          <p style="color:#b91c1c;"><b>Weclapp nicht aktiv:</b> {w.get('error','')}</p>
+        </div>
         """
     else:
         weclapp_html = f"""
-          <div class="box">
-            <h2>Weclapp USt-Status ({res['period_from']} bis {res['period_to']})</h2>
-            <ul>
-              <li><strong>Vorsteuer (Purchase):</strong> {w.get('vorsteuer_sum',0):.2f} €</li>
-              <li><strong>Umsatzsteuer (Sales):</strong> {w.get('umsatzsteuer_sum',0):.2f} €</li>
-              <li><strong>Saldo (Vorsteuer - Umsatzsteuer):</strong> {w.get('saldo',0):.2f} €</li>
-              <li><strong>Status:</strong> {w.get('status','')}</li>
-              <li><strong>Berücksichtigte Belege:</strong> Sales {w.get('sales_count',0)}, Purchase {w.get('purchase_count',0)} (Entity: {w.get('purchase_entity_used','')})</li>
-              <li><strong>Export:</strong> <code>weclapp_ust_details.xlsx</code> (in der ZIP)</li>
-            </ul>
-          </div>
+        <div class="box">
+          <h2>Weclapp USt-Status ({period_from} bis {period_to})</h2>
+          <ul style="line-height:1.7;">
+            <li><b>Vorsteuer (Purchase):</b> {w.get('vorsteuer_sum',0):.2f} €</li>
+            <li><b>Umsatzsteuer (Sales):</b> {w.get('umsatzsteuer_sum',0):.2f} €</li>
+            <li><b>Saldo (Vorsteuer - Umsatzsteuer):</b> {w.get('saldo',0):.2f} €</li>
+            <li><b>Status:</b> {w.get('status','')}</li>
+            <li><b>Export:</b> weclapp_ust_details.xlsx (in der ZIP)</li>
+          </ul>
+        </div>
         """
 
     return f"""
@@ -1114,11 +1249,14 @@ async def run(
       <head>
         <title>Analyse abgeschlossen</title>
         <style>
-          body {{ font-family: system-ui, -apple-system, Segoe UI, sans-serif; max-width: 900px; margin: 40px auto; padding: 0 16px; }}
-          ul {{ line-height: 1.7; }}
-          a.button {{ display:inline-block; margin-top: 1.2rem; padding:10px 18px; background:#2563eb; color:#fff; text-decoration:none; border-radius:6px; }}
-          a.button:hover {{ background:#1d4ed8; }}
-          .box {{ border:1px solid #e5e7eb; border-radius:10px; padding:14px; background:#fafafa; margin-top: 12px; }}
+          :root {{ --primary:{PRIMARY_COLOR}; }}
+          body {{ font-family: system-ui; max-width: 980px; margin: 40px auto; padding: 0 16px; }}
+          .box {{ border:1px solid #e5e7eb; border-radius: 10px; padding: 14px; background: #fafafa; margin-top: 12px; }}
+          a.button {{
+            display:inline-block; margin-top: 14px; padding:10px 18px;
+            background: var(--primary); color:#fff; text-decoration:none; border-radius:8px;
+          }}
+          a.button:hover {{ opacity:0.9; }}
           .legal {{ margin-top:2rem; font-size:0.75rem; color:#777; line-height:1.4; }}
         </style>
       </head>
@@ -1126,22 +1264,22 @@ async def run(
         <h1>Analyse abgeschlossen</h1>
 
         <div class="box">
-          <h2>Matching</h2>
-          <ul>
-            <li><strong>Sichere Matches gesamt:</strong> {res['anzahl_sicher']}</li>
-            <li>&nbsp;&nbsp;&bull; davon gebuchte Belege: {res['anzahl_sicher_gebucht']}</li>
-            <li>&nbsp;&nbsp;&bull; davon Posteingang-Rechnungen: {res['anzahl_sicher_post']}</li>
-            <li>&nbsp;&nbsp;&bull; davon Rechnungsnr im Kontoauszug (Invoice-First): {res.get('anzahl_sicher_invoice',0)}</li>
-            <li><strong>Unklare Fälle:</strong> {res['anzahl_unklar']}</li>
-            <li><strong>Konto ohne Beleg:</strong> {res['anzahl_fehlende']}</li>
-            <li>&nbsp;&nbsp;&bull; davon Kassenbuchungen vermutet: {res['anzahl_kasse']}</li>
+          <h2>DATEV Matching</h2>
+          <ul style="line-height:1.7;">
+            <li><b>Sichere Matches gesamt:</b> {datev_res['anzahl_sicher']}</li>
+            <li>&nbsp;&nbsp;• davon gebuchte Belege: {datev_res['anzahl_sicher_gebucht']}</li>
+            <li>&nbsp;&nbsp;• davon Posteingang-Rechnungen: {datev_res['anzahl_sicher_post']}</li>
+            <li>&nbsp;&nbsp;• davon Rechnungsnr im Kontoauszug (Invoice-First): {datev_res.get('anzahl_sicher_invoice',0)}</li>
+            <li><b>Unklare Fälle:</b> {datev_res['anzahl_unklar']}</li>
+            <li><b>Konto ohne Beleg:</b> {datev_res['anzahl_fehlende']}</li>
+            <li>&nbsp;&nbsp;• davon Kassenbuchungen vermutet: {datev_res['anzahl_kasse']}</li>
           </ul>
+          <a class="button" href="/download-zip">Ergebnis-ZIP herunterladen</a>
         </div>
 
         {weclapp_html}
 
-        <a href="/download" class="button">Ergebnis-ZIP herunterladen</a>
-        <div style="margin-top:1rem;"><a href="/">Neue Analyse starten</a></div>
+        <p style="margin-top:14px;"><a href="/">Neue Analyse starten</a></p>
 
         <div class="legal">
           © NEXTWAVE GmbH – Alle Rechte vorbehalten.<br>
@@ -1152,16 +1290,28 @@ async def run(
     </html>
     """
 
-@app.get("/download")
+
+# =========================
+# DOWNLOADS
+# =========================
+@app.get("/download-zip")
 def download_zip():
     zip_path = OUTPUT_DIR / "datev_analyse_ergebnisse.zip"
     if not zip_path.exists():
-        return HTMLResponse("<h1>Keine ZIP gefunden</h1><p>Bitte zuerst eine Analyse starten.</p>", status_code=404)
+        return HTMLResponse("<h1>Keine ZIP gefunden</h1><p>Bitte zuerst eine DATEV Analyse starten.</p><p><a href='/'>Zurück</a></p>", status_code=404)
     return FileResponse(zip_path, media_type="application/zip", filename="datev_analyse_ergebnisse.zip")
+
+@app.get("/download-weclapp")
+def download_weclapp():
+    xlsx = OUTPUT_DIR / "weclapp_ust_details.xlsx"
+    if not xlsx.exists():
+        return HTMLResponse("<h1>Keine Weclapp Excel gefunden</h1><p>Bitte zuerst Weclapp USt-Status berechnen.</p><p><a href='/'>Zurück</a></p>", status_code=404)
+    return FileResponse(xlsx, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", filename="weclapp_ust_details.xlsx")
 
 @app.get("/logo.png")
 def logo():
     return FileResponse(BASE_DIR / "nextwave_logo.png", media_type="image/png")
+
 
 if __name__ == "__main__":
     uvicorn.run(app, host="127.0.0.1", port=8000)
