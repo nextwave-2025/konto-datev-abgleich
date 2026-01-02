@@ -66,9 +66,9 @@ RC_KEYWORDS = [
 ]
 
 # UI / Branding
-NEXTWAVE_ORANGE = "#DE6A00"  # dein Orange (falls du einen anderen Code willst: hier ändern)
+NEXTWAVE_ORANGE = "#F15124"  # dein Orange (falls du einen anderen Code willst: hier ändern)
 NEXTWAVE_DARK = "#111827"
-NEXTWAVE_BLUE = "#2563eb"
+NEXTWAVE_BLUE = "#F15124"
 
 # ============================================================
 # FASTAPI
