@@ -95,20 +95,7 @@ def weclapp_check_company() -> tuple[bool, str]:
     Stabiler Check: GET /article?limit=1
     (Endpoint existiert in der Regel immer; Rückgabe kann leer sein, ist aber 200.)
     """
-    # Debug: welche ENV-Keys existieren wirklich?
-    env_keys = [
-        "WECLAPP_BASE_URL", "WECLAPP_API_BASE_URL", "WECLAPP_URL", "WECLAPP_BASEURL",
-        "WECLAPP_API_TOKEN", "WECLAPP_TOKEN", "WECLAPP_AUTH_TOKEN", "WECLAPP_AUTHENTICATIONTOKEN",
-        "AUTHENTICATIONTOKEN"
-    ]
-    try:
-        parts = []
-        for k in env_keys:
-            parts.append(f"{k}=<{'set' if os.getenv(k) else 'missing'}>")
-        print("[WECLAPP][ENV_KEYS] " + " | ".join(parts))
-        print(f"[WECLAPP] base_url_set: {bool(weclapp_base_url())} token_set: {bool(weclapp_token())} base_url: {weclapp_base_url()}")
-    except Exception:
-        pass
+   
 
     if not weclapp_configured():
         return False, "nicht konfiguriert"
