@@ -120,8 +120,7 @@ def weclapp_check_company() -> tuple[bool, str]:
 
 def parse_weclapp_date(d: str):
     try:
-        val = datetime.fromisoformat(d.replace("Z", "+00:00")).date()
-        return val
+        return datetime.fromisoformat(d.replace("Z", "+00:00")).date()
     except Exception:
         try:
             val = pd.to_datetime(d, errors="coerce")
