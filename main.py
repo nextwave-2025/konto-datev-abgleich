@@ -90,21 +90,35 @@ def weclapp_headers() -> dict:
     # weclapp erwartet AuthenticationToken Header
     return {"AuthenticationToken": weclapp_token()}
 
+def weclapp_get(path: str, params: dict | None = None):
+    if requests is None:
+        raise RuntimeError("requests fehlt")
+    base = weclapp_base_url().rstrip("/")
+    url = base + (path if path.startswith("/") else "/" + path)
+    return requests.get(url, headers=weclapp_headers(), params=params or {}, timeout=30)
+
 def weclapp_check_company() -> tuple[bool, str]:
     """
     Stabiler Check: GET /article?limit=1
     (Endpoint existiert in der Regel immer; Rückgabe kann leer sein, ist aber 200.)
     """
-   def weclapp_get(path: str, params: dict | None = None):
+    if not weclapp_configured():
+        return False, "nicht konfiguriert"
+
     if requests is None:
-        raise RuntimeError("requests fehlt")
-    base = weclapp_base_url().rstrip("/")
-    url = base + (path if path.startswith("/") else "/" + path)
-    r = requests.get(url, headers=weclapp_headers(), params=params or {}, timeout=30)
-    return r
+        return False, "requests fehlt (bitte in requirements.txt aufnehmen)"
+
+    try:
+        r = weclapp_get("/article", params={"limit": 1})
+        if r.status_code < 300:
+            return True, "verbunden"
+        if r.status_code in (401, 403):
+            return False, f"nicht autorisiert (HTTP {r.status_code})"
+        return False, f"API-Fehler (HTTP {r.status_code})"
+    except Exception as e:
+        return False, f"Verbindung fehlgeschlagen: {str(e)}"
 
 def parse_weclapp_date(d: str):
-    # weclapp liefert oft ISO strings; wir brauchen nur date
     try:
         return datetime.fromisoformat(d.replace("Z", "+00:00")).date()
     except Exception:
@@ -114,12 +128,6 @@ def parse_weclapp_date(d: str):
             return None
 
 def compute_weclapp_vat_summary(date_from: str, date_to: str) -> dict:
-    """
-    Simple Weclapp USt-Auswertung (wenn verfügbar):
-    - Ausgangsrechnungen: salesInvoice
-    - Eingangsrechnungen: purchaseInvoice
-    Summiert gross/net/tax, falls Felder vorhanden sind.
-    """
     df = datetime.strptime(date_from, "%Y-%m-%d").date() if date_from else None
     dt = datetime.strptime(date_to, "%Y-%m-%d").date() if date_to else None
 
@@ -129,7 +137,6 @@ def compute_weclapp_vat_summary(date_from: str, date_to: str) -> dict:
         return df <= d <= dt
 
     def sum_invoices(endpoint: str) -> dict:
-        # weclapp paging: limit + offset
         limit = 100
         offset = 0
         gross = 0.0
@@ -137,7 +144,6 @@ def compute_weclapp_vat_summary(date_from: str, date_to: str) -> dict:
         tax = 0.0
         count = 0
 
-        # wir holen iterativ; stop wenn weniger als limit zurückkommt
         while True:
             r = weclapp_get(f"/{endpoint}", params={"limit": limit, "offset": offset})
             if r.status_code == 404:
@@ -154,14 +160,11 @@ def compute_weclapp_vat_summary(date_from: str, date_to: str) -> dict:
                 break
 
             for inv in rows:
-                # Datum-Feld (je nach Objekt)
                 date_str = inv.get("invoiceDate") or inv.get("documentDate") or inv.get("createdDate")
                 inv_date = parse_weclapp_date(str(date_str)) if date_str else None
                 if not in_range(inv_date):
                     continue
 
-                # Summen-Felder (je nach Objekt / Konfiguration)
-                # sehr häufig: grossAmount / netAmount / taxAmount
                 g = inv.get("grossAmount") or inv.get("gross") or inv.get("totalGrossAmount") or 0
                 n = inv.get("netAmount") or inv.get("net") or inv.get("totalNetAmount") or 0
                 t = inv.get("taxAmount") or inv.get("vatAmount") or inv.get("totalTaxAmount") or 0
@@ -186,7 +189,7 @@ def compute_weclapp_vat_summary(date_from: str, date_to: str) -> dict:
     if (not out_res.get("ok")) and (not in_res.get("ok")):
         return {
             "ok": False,
-            "error": "Konnte weder salesInvoice noch purchaseInvoice lesen. " +
+            "error": "Konnte weder salesInvoice noch purchaseInvoice lesen. "
                      f"Ausgang: {out_res.get('error')} | Eingang: {in_res.get('error')}"
         }
 
@@ -202,26 +205,6 @@ def compute_weclapp_vat_summary(date_from: str, date_to: str) -> dict:
         "vorsteuer": round(vorsteuer, 2),
         "saldo": saldo
     }
-
-
-    if not weclapp_configured():
-        return False, "nicht konfiguriert"
-
-    if requests is None:
-        return False, "requests fehlt (bitte in requirements.txt aufnehmen)"
-
-    base = weclapp_base_url().rstrip("/")
-    url = f"{base}/article?limit=1"
-
-    try:
-        r = requests.get(url, headers=weclapp_headers(), timeout=15)
-        if r.status_code < 300:
-            return True, "verbunden"
-        if r.status_code in (401, 403):
-            return False, f"nicht autorisiert (HTTP {r.status_code})"
-        return False, f"API-Fehler (HTTP {r.status_code})"
-    except Exception as e:
-        return False, f"Verbindung fehlgeschlagen: {str(e)}"
 
 # ============================================================
 # HELPER
