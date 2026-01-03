@@ -120,10 +120,14 @@ def weclapp_check_company() -> tuple[bool, str]:
 
 def parse_weclapp_date(d: str):
     try:
-        return datetime.fromisoformat(d.replace("Z", "+00:00")).date()
+        val = datetime.fromisoformat(d.replace("Z", "+00:00")).date()
+        return val
     except Exception:
         try:
-            return pd.to_datetime(d, errors="coerce").date()
+            val = pd.to_datetime(d, errors="coerce")
+            if pd.isna(val):
+                return None
+            return val.date()
         except Exception:
             return None
 
@@ -131,10 +135,12 @@ def compute_weclapp_vat_summary(date_from: str, date_to: str) -> dict:
     df = datetime.strptime(date_from, "%Y-%m-%d").date() if date_from else None
     dt = datetime.strptime(date_to, "%Y-%m-%d").date() if date_to else None
 
-    def in_range(d):
-        if not d or not df or not dt:
-            return True
-        return df <= d <= dt
+   def in_range(d):
+    if d is None:
+        return False
+    if df is None or dt is None:
+        return True
+    return df <= d <= dt
 
     def sum_invoices(endpoint: str) -> dict:
         limit = 100
