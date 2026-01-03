@@ -95,7 +95,114 @@ def weclapp_check_company() -> tuple[bool, str]:
     Stabiler Check: GET /article?limit=1
     (Endpoint existiert in der Regel immer; Rückgabe kann leer sein, ist aber 200.)
     """
-   
+   def weclapp_get(path: str, params: dict | None = None):
+    if requests is None:
+        raise RuntimeError("requests fehlt")
+    base = weclapp_base_url().rstrip("/")
+    url = base + (path if path.startswith("/") else "/" + path)
+    r = requests.get(url, headers=weclapp_headers(), params=params or {}, timeout=30)
+    return r
+
+def parse_weclapp_date(d: str):
+    # weclapp liefert oft ISO strings; wir brauchen nur date
+    try:
+        return datetime.fromisoformat(d.replace("Z", "+00:00")).date()
+    except Exception:
+        try:
+            return pd.to_datetime(d, errors="coerce").date()
+        except Exception:
+            return None
+
+def compute_weclapp_vat_summary(date_from: str, date_to: str) -> dict:
+    """
+    Simple Weclapp USt-Auswertung (wenn verfügbar):
+    - Ausgangsrechnungen: salesInvoice
+    - Eingangsrechnungen: purchaseInvoice
+    Summiert gross/net/tax, falls Felder vorhanden sind.
+    """
+    df = datetime.strptime(date_from, "%Y-%m-%d").date() if date_from else None
+    dt = datetime.strptime(date_to, "%Y-%m-%d").date() if date_to else None
+
+    def in_range(d):
+        if not d or not df or not dt:
+            return True
+        return df <= d <= dt
+
+    def sum_invoices(endpoint: str) -> dict:
+        # weclapp paging: limit + offset
+        limit = 100
+        offset = 0
+        gross = 0.0
+        net = 0.0
+        tax = 0.0
+        count = 0
+
+        # wir holen iterativ; stop wenn weniger als limit zurückkommt
+        while True:
+            r = weclapp_get(f"/{endpoint}", params={"limit": limit, "offset": offset})
+            if r.status_code == 404:
+                return {"ok": False, "error": f"Endpoint /{endpoint} nicht gefunden (HTTP 404)."}
+            if r.status_code >= 300:
+                return {"ok": False, "error": f"/{endpoint} API-Fehler (HTTP {r.status_code}): {r.text[:200]}"}
+
+            data = r.json()
+            rows = data.get("result", data) if isinstance(data, dict) else data
+            if not isinstance(rows, list):
+                rows = []
+
+            if not rows:
+                break
+
+            for inv in rows:
+                # Datum-Feld (je nach Objekt)
+                date_str = inv.get("invoiceDate") or inv.get("documentDate") or inv.get("createdDate")
+                inv_date = parse_weclapp_date(str(date_str)) if date_str else None
+                if not in_range(inv_date):
+                    continue
+
+                # Summen-Felder (je nach Objekt / Konfiguration)
+                # sehr häufig: grossAmount / netAmount / taxAmount
+                g = inv.get("grossAmount") or inv.get("gross") or inv.get("totalGrossAmount") or 0
+                n = inv.get("netAmount") or inv.get("net") or inv.get("totalNetAmount") or 0
+                t = inv.get("taxAmount") or inv.get("vatAmount") or inv.get("totalTaxAmount") or 0
+
+                try:
+                    gross += float(g or 0)
+                    net += float(n or 0)
+                    tax += float(t or 0)
+                    count += 1
+                except Exception:
+                    continue
+
+            if len(rows) < limit:
+                break
+            offset += limit
+
+        return {"ok": True, "count": count, "gross": round(gross, 2), "net": round(net, 2), "tax": round(tax, 2)}
+
+    out_res = sum_invoices("salesInvoice")
+    in_res = sum_invoices("purchaseInvoice")
+
+    if (not out_res.get("ok")) and (not in_res.get("ok")):
+        return {
+            "ok": False,
+            "error": "Konnte weder salesInvoice noch purchaseInvoice lesen. " +
+                     f"Ausgang: {out_res.get('error')} | Eingang: {in_res.get('error')}"
+        }
+
+    ust_ausgang = out_res["tax"] if out_res.get("ok") else 0.0
+    vorsteuer = in_res["tax"] if in_res.get("ok") else 0.0
+    saldo = round(ust_ausgang - vorsteuer, 2)
+
+    return {
+        "ok": True,
+        "out": out_res,
+        "in": in_res,
+        "ust_ausgang": round(ust_ausgang, 2),
+        "vorsteuer": round(vorsteuer, 2),
+        "saldo": saldo
+    }
+
 
     if not weclapp_configured():
         return False, "nicht konfiguriert"
@@ -996,9 +1103,19 @@ async def weclapp_ust(
     date_from: str = Form(""),
     date_to: str = Form("")
 ):
-
     ok, msg = weclapp_check_company()
 
+    summary = None
+    err = None
+    if ok and date_from and date_to:
+        try:
+            summary = compute_weclapp_vat_summary(date_from, date_to)
+            if not summary.get("ok"):
+                err = summary.get("error")
+        except Exception as e:
+            err = str(e)
+
+    # CSV (optional)
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     pd.DataFrame([{
         "date_from": date_from,
@@ -1007,11 +1124,47 @@ async def weclapp_ust(
         "api_ok": ok,
         "status": msg,
         "base_url": weclapp_base_url(),
-        "token_set": bool(weclapp_token())
+        "token_set": bool(weclapp_token()),
+        "weclapp_vat_ok": bool(summary and summary.get("ok")),
+        "error": err or ""
     }]).to_csv(OUTPUT_DIR / "weclapp_status.csv", sep=";", index=False, encoding="utf-8-sig")
 
     color = "#065f46" if ok else "#991b1b"
     headline = "Weclapp OK" if ok else "Weclapp Problem"
+
+    def fmt(x):
+        try:
+            return f"{float(x):,.2f} €".replace(",", "X").replace(".", ",").replace("X", ".")
+        except Exception:
+            return "0,00 €"
+
+    result_html = ""
+    if ok and date_from and date_to and summary and summary.get("ok"):
+        result_html = f"""
+          <h3 style="margin-top:18px;">USt-Auswertung (Weclapp)</h3>
+          <ul style="line-height:1.8; margin: 10px 0 0 0;">
+            <li><strong>USt (Ausgang):</strong> {fmt(summary.get('ust_ausgang'))}</li>
+            <li><strong>Vorsteuer (Eingang):</strong> {fmt(summary.get('vorsteuer'))}</li>
+            <li><strong>Saldo:</strong> {fmt(summary.get('saldo'))}</li>
+            <li style="margin-top:8px; color:#6b7280;">
+              Ausgangsrechnungen gezählt: {summary.get('out',{}).get('count',0)} |
+              Eingangsrechnungen gezählt: {summary.get('in',{}).get('count',0)}
+            </li>
+          </ul>
+        """
+    elif ok and date_from and date_to and err:
+        result_html = f"""
+          <div style="margin-top:16px; padding:12px; border-radius:10px; background:#fff7ed; border:1px solid #fed7aa; color:#9a3412;">
+            <strong>Hinweis:</strong> Verbindung steht, aber die USt-Auswertung konnte nicht berechnet werden.<br>
+            <span style="font-family: ui-monospace, SFMono-Regular, Menlo, monospace;">{err}</span>
+          </div>
+        """
+    elif ok:
+        result_html = """
+          <div style="margin-top:16px; color:#6b7280;">
+            Zeitraum fehlt – bitte auf der Startseite Von/Bis auswählen und erneut starten.
+          </div>
+        """
 
     return f"""
     <html>
@@ -1030,104 +1183,15 @@ async def weclapp_ust(
         <div class="box">
           <div class="badge">{msg}</div>
           <p style="margin-top:12px; color:#374151;">
-            Zeitraum: <strong>{date_from or "–"}</strong> bis <strong>{date_to or "–"}</strong><br>
+            Zeitraum: <strong>{date_from or "–"}</strong> bis <strong>{date_to or "–"}</strong>
           </p>
+          {result_html}
           <a class="button" href="/">Zurück</a>
         </div>
       </body>
     </html>
     """
 
-@app.post("/run", response_class=HTMLResponse)
-async def run(konto_file: UploadFile = File(...), belege_file: UploadFile = File(...)):
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-
-    with open(KONTOAUSZUG_CSV, "wb") as f:
-        f.write(await konto_file.read())
-    with open(BELEGE_CSV, "wb") as f:
-        f.write(await belege_file.read())
-
-    res = run_analysis()
-
-    # ZIP bauen
-    zip_path = OUTPUT_DIR / "datev_analyse_ergebnisse.zip"
-    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-        for csv_file in OUTPUT_DIR.glob("*.csv"):
-            zf.write(csv_file, arcname=csv_file.name)
-
-    return f"""
-    <html>
-      <head>
-        <title>Analyse abgeschlossen</title>
-        <style>
-          body {{ font-family: system-ui, -apple-system, Segoe UI, sans-serif; max-width: 860px; margin: 40px auto; padding: 0 16px; }}
-          ul {{ line-height: 1.7; }}
-          a.button {{ display:inline-block; margin-top: 1.2rem; padding:10px 18px; background:#2563eb; color:#fff; text-decoration:none; border-radius:8px; }}
-          a.button:hover {{ background:#1d4ed8; }}
-          .box {{ border:1px solid #e5e7eb; border-radius:12px; padding:14px; background:#fafafa; margin-top: 12px; }}
-          .legal {{ margin-top:2rem; font-size:0.75rem; color:#777; line-height:1.4; }}
-          code {{ background:#f3f4f6; padding:2px 6px; border-radius:6px; }}
-        </style>
-      </head>
-      <body>
-        <h1>Analyse abgeschlossen</h1>
-
-        <div class="box">
-          <h2>Matching</h2>
-          <ul>
-            <li><strong>Sichere Matches gesamt:</strong> {res['anzahl_sicher']}</li>
-            <li>&nbsp;&nbsp;&bull; davon gebuchte Belege: {res['anzahl_sicher_gebucht']}</li>
-            <li>&nbsp;&nbsp;&bull; davon Posteingang-Rechnungen: {res['anzahl_sicher_post']}</li>
-            <li><strong>Unklare Fälle:</strong> {res['anzahl_unklar']}</li>
-            <li><strong>Fehlende Belege gesamt:</strong> {res['anzahl_fehlende']}</li>
-            <li>&nbsp;&nbsp;&bull; davon Kassenbuchungen vermutet: {res['anzahl_kasse']}</li>
-          </ul>
-        </div>
-
-        <div class="box">
-          <h2>USt &amp; Betriebsergebnis (Quartal)</h2>
-          <p style="color:#374151; margin-top:0;">
-            KPI basiert auf DATEV-Logik (BU/Konto), ignoriert USD und Reverse-Charge/Ausland.<br>
-            Details in der ZIP: <code>ust_betriebsergebnis.csv</code>, <code>ust_methoden_stats.csv</code>, <code>kpi_offen.csv</code>, <code>kpi_ignoriert.csv</code>.
-          </p>
-          <ul>
-            <li><strong>USt (Ausgang):</strong> {format_eur(res.get('ust_ausgang_sum',0))}</li>
-            <li><strong>Vorsteuer (Eingang):</strong> {format_eur(res.get('vorsteuer_sum',0))}</li>
-            <li><strong>USt-Saldo:</strong> {format_eur(res.get('ust_saldo',0))} <small>({res.get('ust_interpretation','')})</small></li>
-            <li><strong>Umsatz netto:</strong> {format_eur(res.get('umsatz_netto',0))}</li>
-            <li><strong>Kosten netto:</strong> {format_eur(res.get('kosten_netto',0))}</li>
-            <li><strong>Betriebsergebnis:</strong> {format_eur(res.get('betriebsergebnis',0))}</li>
-            <li><strong>Abdeckung (berechnet):</strong>
-              Ausgang {res.get('ausgang_covered_kpi',0)}/{res.get('ausgang_total_kpi',0)},
-              Eingang {res.get('eingang_covered_kpi',0)}/{res.get('eingang_total_kpi',0)}
-            </li>
-            <li><strong>Ignoriert (KPI):</strong> {res.get('ignored_total',0)} Belege
-              (USD: {res.get('ignored_usd',0)}, RC/Ausland: {res.get('ignored_rc',0)})</li>
-            <li><strong>Brutto ignoriert:</strong> {format_eur(res.get('brutto_ignored',0))}</li>
-          </ul>
-        </div>
-
-        <div class="box">
-          <h2>Weclapp Status</h2>
-          <p style="color:#374151; margin-top:0;">
-            Details in der ZIP: <code>weclapp_status.csv</code>
-          </p>
-          <ul>
-            <li><strong>Weclapp:</strong> {"✅" if res.get("weclapp_api_ok") else "⚠️"} {res.get("weclapp_status_msg","")}</li>
-          </ul>
-        </div>
-
-        <a href="/download" class="button">Ergebnis-ZIP herunterladen</a>
-        <div style="margin-top:1rem;"><a href="/">Neue Analyse starten</a></div>
-
-        <div class="legal">
-          © NEXTWAVE GmbH – Alle Rechte vorbehalten.<br>
-          Die Nutzung dieses Programms oder von Teilen daraus ohne vorherige schriftliche Zustimmung der NEXTWAVE GmbH
-          ist untersagt und kann zivil- und strafrechtliche Schritte nach sich ziehen.
-        </div>
-      </body>
-    </html>
-    """
 
 @app.get("/download")
 def download_zip():
