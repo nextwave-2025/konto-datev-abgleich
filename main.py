@@ -7,7 +7,7 @@ from datetime import datetime
 import numpy as np
 import pandas as pd
 
-from fastapi import FastAPI, UploadFile, File
+from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.responses import HTMLResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 import uvicorn
@@ -839,7 +839,7 @@ def index():
 
           /* Buttons */
           button {{ padding:10px 18px; font-size:16px; border-radius:8px; border:none; cursor:pointer; color:white; }}
-          .btn-primary {{ background:#f59e0b; }}              /* ORANGE */
+          .btn-primary {{ background:#f15124; }}              /* ORANGE */
           .btn-primary:hover {{ background:#d97706; }}
           .btn-secondary {{ background:#111827; }}
           .btn-secondary:hover {{ background:#0b1220; }}
@@ -992,7 +992,11 @@ def index():
     """
 
 @app.post("/weclapp-ust", response_class=HTMLResponse)
-async def weclapp_ust(date_from: str = "", date_to: str = ""):
+async def weclapp_ust(
+    date_from: str = Form(""),
+    date_to: str = Form("")
+):
+
     ok, msg = weclapp_check_company()
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
