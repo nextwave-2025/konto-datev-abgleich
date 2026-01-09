@@ -79,9 +79,10 @@ def weclapp_check_company() -> tuple[bool, str]:
     if requests is None:
         return False, "requests fehlt (Python package). Bitte requests in requirements.txt aufnehmen."
 
-    url = weclapp_base_url().rstrip("/") + "/company"
+    # "company" ist nicht überall verfügbar -> nimm einen sicheren Standard-Endpoint
+    test_url = weclapp_base_url().rstrip("/") + "/user"
     try:
-        r = requests.get(url, headers=weclapp_headers(), timeout=15)
+        r = requests.get(test_url, headers=weclapp_headers(), params={"pageSize": 1}, timeout=15)
         if r.status_code < 300:
             return True, "verbunden"
         return False, f"konfiguriert, aber API-Fehler (HTTP {r.status_code})"
