@@ -2,7 +2,7 @@ import os
 import re
 import zipfile
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, date
 
 import numpy as np
 import pandas as pd
@@ -12,11 +12,11 @@ from fastapi.responses import HTMLResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 import uvicorn
 
-# Optional: requests (sehr üblich). Falls nicht vorhanden, bitte in requirements aufnehmen.
 try:
     import requests
 except Exception:
     requests = None
+
 
 # ============================================================
 # KONFIGURATION
@@ -24,38 +24,21 @@ except Exception:
 
 BASE_DIR = Path(__file__).parent
 
-# Eingangsdateien (werden bei Upload überschrieben)
 KONTOAUSZUG_CSV = BASE_DIR / "kontoauszug.csv"
 BELEGE_CSV = BASE_DIR / "belege.csv"
 
-# Ausgabe
 OUTPUT_DIR = BASE_DIR / "output"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-# Matching-Toleranzen
 BETRAG_TOLERANZ = 0.01
 DATUM_FENSTER_TAGE = 30
-
-# Falls du eine bestimmte Status-Spalte erzwingen willst (z.B. "Gebucht"):
 STATUS_SPALTE_MANUELL = None
 
-# KPI-Fallback (nur wenn gar nichts ableitbar) – Empfehlung: None lassen
-DEFAULT_RATE_FALLBACK = None  # z.B. 0.19
+DEFAULT_RATE_FALLBACK = None  # besser None lassen
 
-# BU -> Steuersatz Mapping (DATEV-typisch / eure Daten)
-BU_RATE_MAP = {
-    "401": 0.19,
-    "402": 0.07,
-}
+BU_RATE_MAP = {"401": 0.19, "402": 0.07}
+OUTGOING_KONTO_RATE = {"4400": 0.19, "4120": 0.19, "4125": 0.19}
 
-# Outgoing Erlöskonten -> Steuersatz (aus euren Daten beobachtet)
-OUTGOING_KONTO_RATE = {
-    "4400": 0.19,
-    "4120": 0.19,
-    "4125": 0.19,
-}
-
-# Reverse-Charge / Ausland Keywords (unterstützend, nicht allein entscheidend)
 RC_KEYWORDS = [
     "reverse charge", "rev. charge", "rc-verfahren",
     "§13b", "13b", "paragraf 13b",
@@ -65,6 +48,7 @@ RC_KEYWORDS = [
     "export", "ausfuhr", "ig-erwerb", "ig erwerb"
 ]
 
+
 # ============================================================
 # FASTAPI
 # ============================================================
@@ -72,12 +56,12 @@ RC_KEYWORDS = [
 app = FastAPI()
 app.mount("/static", StaticFiles(directory=BASE_DIR), name="static")
 
+
 # ============================================================
-# WECLAPP – ENV / STATUS / API-CHECK
+# WECLAPP ENV / API
 # ============================================================
 
 def weclapp_base_url() -> str:
-    # erwartetes Format: https://<TENANT>.weclapp.com/webapp/api/v1
     return os.getenv("WECLAPP_BASE_URL", "").strip()
 
 def weclapp_token() -> str:
@@ -87,132 +71,26 @@ def weclapp_configured() -> bool:
     return bool(weclapp_base_url() and weclapp_token())
 
 def weclapp_headers() -> dict:
-    # weclapp erwartet AuthenticationToken Header
     return {"AuthenticationToken": weclapp_token()}
 
-def weclapp_get(path: str, params: dict | None = None):
-    if requests is None:
-        raise RuntimeError("requests fehlt")
-    base = weclapp_base_url().rstrip("/")
-    url = base + (path if path.startswith("/") else "/" + path)
-    return requests.get(url, headers=weclapp_headers(), params=params or {}, timeout=30)
-
 def weclapp_check_company() -> tuple[bool, str]:
-    """
-    Stabiler Check: GET /article?limit=1
-    (Endpoint existiert in der Regel immer; Rückgabe kann leer sein, ist aber 200.)
-    """
     if not weclapp_configured():
-        return False, "nicht konfiguriert"
-
+        return False, "nicht konfiguriert (WECLAPP_BASE_URL/WECLAPP_API_TOKEN fehlen)"
     if requests is None:
-        return False, "requests fehlt (bitte in requirements.txt aufnehmen)"
+        return False, "requests fehlt (Python package). Bitte requests in requirements.txt aufnehmen."
 
+    url = weclapp_base_url().rstrip("/") + "/company"
     try:
-        r = weclapp_get("/article", params={"limit": 1})
+        r = requests.get(url, headers=weclapp_headers(), timeout=15)
         if r.status_code < 300:
             return True, "verbunden"
-        if r.status_code in (401, 403):
-            return False, f"nicht autorisiert (HTTP {r.status_code})"
-        return False, f"API-Fehler (HTTP {r.status_code})"
+        return False, f"konfiguriert, aber API-Fehler (HTTP {r.status_code})"
     except Exception as e:
-        return False, f"Verbindung fehlgeschlagen: {str(e)}"
+        return False, f"konfiguriert, aber Verbindung fehlgeschlagen: {str(e)}"
 
-def parse_weclapp_date(d: str):
-    try:
-        return datetime.fromisoformat(d.replace("Z", "+00:00")).date()
-    except Exception:
-        try:
-            val = pd.to_datetime(d, errors="coerce")
-            if pd.isna(val):
-                return None
-            return val.date()
-        except Exception:
-            return None
-
-def compute_weclapp_vat_summary(date_from: str, date_to: str) -> dict:
-    df = datetime.strptime(date_from, "%Y-%m-%d").date() if date_from else None
-    dt = datetime.strptime(date_to, "%Y-%m-%d").date() if date_to else None
-
-    def in_range(d):
-        if d is None:
-            return False
-        if df is None or dt is None:
-            return True
-        return df <= d <= dt
-
-    def sum_invoices(endpoint: str) -> dict:
-        limit = 100
-        offset = 0
-        gross = 0.0
-        net = 0.0
-        tax = 0.0
-        count = 0
-
-        while True:
-            r = weclapp_get(f"/{endpoint}", params={"limit": limit, "offset": offset})
-            if r.status_code == 404:
-                return {"ok": False, "error": f"Endpoint /{endpoint} nicht gefunden (HTTP 404)."}
-            if r.status_code >= 300:
-                return {"ok": False, "error": f"/{endpoint} API-Fehler (HTTP {r.status_code}): {r.text[:200]}"}
-
-            data = r.json()
-            rows = data.get("result", data) if isinstance(data, dict) else data
-            if not isinstance(rows, list):
-                rows = []
-
-            if not rows:
-                break
-
-            for inv in rows:
-                date_str = inv.get("invoiceDate") or inv.get("documentDate") or inv.get("createdDate")
-                inv_date = parse_weclapp_date(str(date_str)) if date_str else None
-                if not in_range(inv_date):
-                    continue
-
-                g = inv.get("grossAmount") or inv.get("gross") or inv.get("totalGrossAmount") or 0
-                n = inv.get("netAmount") or inv.get("net") or inv.get("totalNetAmount") or 0
-                t = inv.get("taxAmount") or inv.get("vatAmount") or inv.get("totalTaxAmount") or 0
-
-                try:
-                    gross += float(g or 0)
-                    net += float(n or 0)
-                    tax += float(t or 0)
-                    count += 1
-                except Exception:
-                    continue
-
-            if len(rows) < limit:
-                break
-            offset += limit
-
-        return {"ok": True, "count": count, "gross": round(gross, 2), "net": round(net, 2), "tax": round(tax, 2)}
-
-    out_res = sum_invoices("salesInvoice")
-    in_res = sum_invoices("purchaseInvoice")
-
-    if (not out_res.get("ok")) and (not in_res.get("ok")):
-        return {
-            "ok": False,
-            "error": "Konnte weder salesInvoice noch purchaseInvoice lesen. "
-                     f"Ausgang: {out_res.get('error')} | Eingang: {in_res.get('error')}"
-        }
-
-    ust_ausgang = out_res["tax"] if out_res.get("ok") else 0.0
-    vorsteuer = in_res["tax"] if in_res.get("ok") else 0.0
-    saldo = round(ust_ausgang - vorsteuer, 2)
-
-    return {
-        "ok": True,
-        "out": out_res,
-        "in": in_res,
-        "ust_ausgang": round(ust_ausgang, 2),
-        "vorsteuer": round(vorsteuer, 2),
-        "saldo": saldo
-    }
 
 # ============================================================
-# HELPER
+# GENERIC HELPERS
 # ============================================================
 
 def safe_read_csv(path: Path, sep=";") -> pd.DataFrame:
@@ -325,18 +203,14 @@ def score_match(konto_text, beleg_supplier_text, invoice_number):
     if invoice_number:
         inv_clean = re.sub(r"[^a-zA-Z0-9]", "", str(invoice_number).strip().lower())
         partials = set()
-        if len(inv_clean) >= 4:
-            partials.add(inv_clean[-4:])
-        if len(inv_clean) >= 6:
-            partials.add(inv_clean[-6:])
-        if len(inv_clean) >= 8:
-            partials.add(inv_clean[-8:])
+        if len(inv_clean) >= 4: partials.add(inv_clean[-4:])
+        if len(inv_clean) >= 6: partials.add(inv_clean[-6:])
+        if len(inv_clean) >= 8: partials.add(inv_clean[-8:])
         partials.add(inv_clean)
 
         for p in partials:
             if p and p in konto_text_norm:
                 score += 10
-
         if inv_clean and inv_clean in konto_text_norm:
             score += 20
 
@@ -359,8 +233,15 @@ def looks_like_cash_booking(konto_text, amount):
         return abs(amt) <= 300
     return False
 
+def format_eur(x) -> str:
+    try:
+        return f"{float(x):,.2f} €".replace(",", "X").replace(".", ",").replace("X", ".")
+    except Exception:
+        return "0,00 €"
+
+
 # ============================================================
-# KPI / USt & Betriebsergebnis
+# DATEV KPI (USt & Betriebsergebnis) – bleibt wie gehabt
 # ============================================================
 
 def classify_direction_by_partnerkonto(gp_konto: str) -> str:
@@ -383,7 +264,6 @@ def build_beleg_fulltext(belege_df: pd.DataFrame) -> pd.DataFrame:
             "notiz", "bemerk", "text"
         ]):
             cols.append(c)
-
     if cols:
         belege_df["beleg_fulltext"] = belege_df[cols].astype(str).agg(" ".join, axis=1).str.lower()
     else:
@@ -449,13 +329,10 @@ def is_reverse_charge_or_foreign(row) -> bool:
 
     if land and land != "DE":
         return True
-
     if vatid_cc and vatid_cc != "DE" and rate_empty_or_zero:
         return True
-
     if has_rc_keyword and rate_empty_or_zero:
         return True
-
     return False
 
 def compute_vat_net_kpi(belege: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
@@ -468,7 +345,6 @@ def compute_vat_net_kpi(belege: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
     belege = build_beleg_fulltext(belege)
 
     belege["kpi_ignore_usd"] = belege.apply(is_usd, axis=1)
-
     rates = belege.apply(infer_rate, axis=1, result_type="expand")
     belege["steuer_rate"] = rates[0]
     belege["vat_methode"] = rates[1]
@@ -484,16 +360,13 @@ def compute_vat_net_kpi(belege: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
         belege.loc[mask_rate, "brutto_calc"]
         - (belege.loc[mask_rate, "brutto_calc"] / (1.0 + belege.loc[mask_rate, "steuer_rate"]))
     ).round(2)
-    belege.loc[mask_rate, "netto_calc"] = (
-        belege.loc[mask_rate, "brutto_calc"] - belege.loc[mask_rate, "ust_calc"]
-    ).round(2)
+    belege.loc[mask_rate, "netto_calc"] = (belege.loc[mask_rate, "brutto_calc"] - belege.loc[mask_rate, "ust_calc"]).round(2)
 
     mask_zero = belege["brutto_calc"].notna() & (~belege["kpi_ignore"]) & (belege["steuer_rate"] == 0.0)
     belege.loc[mask_zero, "ust_calc"] = 0.0
     belege.loc[mask_zero, "netto_calc"] = belege.loc[mask_zero, "brutto_calc"].round(2)
 
     kpi = belege[~belege["kpi_ignore"]].copy()
-
     out_ok = (kpi["richtung"] == "ausgang") & kpi["ust_calc"].notna() & kpi["netto_calc"].notna()
     in_ok = (kpi["richtung"] == "eingang") & kpi["ust_calc"].notna() & kpi["netto_calc"].notna()
 
@@ -515,9 +388,7 @@ def compute_vat_net_kpi(belege: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
     ignored_rc = int(belege["kpi_ignore_rc"].sum())
     brutto_ignored = float(belege.loc[belege["kpi_ignore"], "brutto_calc"].fillna(0).sum())
 
-    methode_stats = (
-        kpi["vat_methode"].value_counts(dropna=False).rename_axis("vat_methode").reset_index(name="count")
-    )
+    methode_stats = kpi["vat_methode"].value_counts(dropna=False).rename_axis("vat_methode").reset_index(name="count")
 
     res = {
         "ust_ausgang_sum": round(ust_ausgang, 2),
@@ -546,31 +417,252 @@ def compute_vat_net_kpi(belege: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
         "steuer_rate", "vat_methode", "brutto_calc", "netto_calc", "ust_calc", "Rechnungs-Nr."
     ] if c in belege.columns]
 
-    belege.loc[belege["kpi_ignore"], debug_cols].to_csv(
-        OUTPUT_DIR / "kpi_ignoriert.csv", sep=";", index=False, encoding="utf-8-sig"
-    )
-
-    kpi.loc[(kpi["netto_calc"].isna()) | (kpi["ust_calc"].isna()), debug_cols].to_csv(
-        OUTPUT_DIR / "kpi_offen.csv", sep=";", index=False, encoding="utf-8-sig"
-    )
+    belege.loc[belege["kpi_ignore"], debug_cols].to_csv(OUTPUT_DIR / "kpi_ignoriert.csv", sep=";", index=False, encoding="utf-8-sig")
+    kpi.loc[(kpi["netto_calc"].isna()) | (kpi["ust_calc"].isna()), debug_cols].to_csv(OUTPUT_DIR / "kpi_offen.csv", sep=";", index=False, encoding="utf-8-sig")
 
     return belege, res
 
+
 # ============================================================
-# HAUPTLOGIK (Matching + KPI)
+# WECLAPP UST (Bestellungen + Rechnungen/Gutschriften, Proforma ignorieren)
+# ============================================================
+
+WECLAPP_DATE_FIELDS = ["invoiceDate", "postingDate", "createdDate", "documentDate", "orderDate", "date"]
+
+# Umsatzsteuerbetrag (Sales Tax / VAT)
+WECLAPP_SALES_TAX_FIELDS = [
+    "salesTaxAmount", "totalSalesTaxAmount",
+    "vatAmount", "totalVatAmount",
+    "taxAmount", "totalTaxAmount",
+    "outputTaxAmount", "totalOutputTaxAmount",
+]
+
+# Vorsteuerbetrag (Input tax)
+WECLAPP_INPUT_TAX_FIELDS = [
+    "inputTaxAmount", "totalInputTaxAmount",
+    "vatAmount", "totalVatAmount",          # fallback, falls Weclapp nur vatAmount liefert
+    "taxAmount", "totalTaxAmount",
+]
+
+# Proforma-Detection (robust)
+PROFORMA_FLAG_FIELDS = [
+    "isProforma", "proforma", "proformaInvoice", "isProformaInvoice"
+]
+PROFORMA_TEXT_FIELDS = [
+    "invoiceNumber", "documentNumber", "number",
+    "status", "invoiceType", "type", "documentType",
+    "description", "remark", "title", "subject",
+]
+
+def parse_iso_date(s) -> date | None:
+    if not s:
+        return None
+    try:
+        return pd.to_datetime(s, errors="coerce").date()
+    except Exception:
+        return None
+
+def pick_first_date(obj: dict, keys: list[str]) -> date | None:
+    for k in keys:
+        if k in obj and obj[k]:
+            d = parse_iso_date(obj[k])
+            if d:
+                return d
+    return None
+
+def pick_first_number(obj: dict, keys: list[str]) -> float | None:
+    for k in keys:
+        if k in obj and obj[k] is not None:
+            try:
+                return float(obj[k])
+            except Exception:
+                pass
+    return None
+
+def is_proforma(doc: dict) -> bool:
+    # 1) echte bool flags
+    for k in PROFORMA_FLAG_FIELDS:
+        if k in doc and isinstance(doc[k], bool) and doc[k] is True:
+            return True
+
+    # 2) text heuristik
+    combined = []
+    for k in PROFORMA_TEXT_FIELDS:
+        if k in doc and doc[k] is not None:
+            combined.append(str(doc[k]))
+    txt = " ".join(combined).lower()
+
+    # typischer proforma text
+    if "proforma" in txt or "pro-forma" in txt:
+        return True
+
+    # optional: Nummern-Heuristik (falls ihr PF/PRO benutzt)
+    if re.search(r"\bpf[-_/ ]?\d+", txt):
+        return True
+
+    return False
+
+def weclapp_fetch_pages(entity: str, max_pages: int = 30, page_size: int = 200) -> list[dict]:
+    """
+    Holt Datensätze seitenweise.
+    Robust gegenüber Weclapp Response-Formaten (list oder {result:[...]})
+    """
+    if requests is None:
+        return []
+    base = weclapp_base_url().rstrip("/")
+    url = f"{base}/{entity}"
+
+    out = []
+    for page in range(1, max_pages + 1):
+        params = {"page": page, "pageSize": page_size}
+        try:
+            r = requests.get(url, headers=weclapp_headers(), params=params, timeout=25)
+            if r.status_code >= 300:
+                break
+            js = r.json()
+            if isinstance(js, list):
+                items = js
+            elif isinstance(js, dict) and "result" in js and isinstance(js["result"], list):
+                items = js["result"]
+            else:
+                break
+
+            if not items:
+                break
+
+            out.extend(items)
+
+            if len(items) < page_size:
+                break
+        except Exception:
+            break
+    return out
+
+def weclapp_sum_tax(entity: str, date_from: date, date_to: date, tax_fields: list[str], sign: int = 1, ignore_proforma: bool = False) -> tuple[int, float, str]:
+    items = weclapp_fetch_pages(entity)
+    if not items:
+        return 0, 0.0, "no_items"
+
+    used = 0
+    tax_sum = 0.0
+
+    for it in items:
+        if ignore_proforma and is_proforma(it):
+            continue
+
+        d = pick_first_date(it, WECLAPP_DATE_FIELDS)
+        if not d:
+            continue
+        if d < date_from or d > date_to:
+            continue
+
+        tax = pick_first_number(it, tax_fields)
+        if tax is None:
+            # fallback: manchmal steckt VAT in einem generischen Feld
+            tax = pick_first_number(it, ["vatAmount", "taxAmount", "totalVatAmount", "totalTaxAmount"])
+        if tax is None:
+            continue
+
+        used += 1
+        tax_sum += (float(tax) * sign)
+
+    return used, round(tax_sum, 2), "ok" if used > 0 else "no_rows_in_range"
+
+def weclapp_ust_calc(date_from_str: str, date_to_str: str) -> dict:
+    ok, msg = weclapp_check_company()
+    if not ok:
+        return {
+            "ok": False,
+            "status": msg,
+            "date_from": date_from_str,
+            "date_to": date_to_str,
+            "out_count": 0,
+            "in_count": 0,
+            "ust_out": 0.0,
+            "ust_in": 0.0,
+            "saldo": 0.0,
+            "hint": "Weclapp nicht erreichbar/konfiguriert.",
+        }
+
+    df = parse_iso_date(date_from_str)
+    dt = parse_iso_date(date_to_str)
+    if not df or not dt:
+        return {
+            "ok": True,
+            "status": msg,
+            "date_from": date_from_str,
+            "date_to": date_to_str,
+            "out_count": 0,
+            "in_count": 0,
+            "ust_out": 0.0,
+            "ust_in": 0.0,
+            "saldo": 0.0,
+            "hint": "Ungültiger Zeitraum.",
+        }
+
+    # Verkauf: Rechnungen (ohne Proforma) + Gutschriften (ohne Proforma, negativ)
+    out_inv_cnt, out_inv_tax, st_inv = weclapp_sum_tax(
+        "salesInvoice", df, dt, WECLAPP_SALES_TAX_FIELDS, sign=+1, ignore_proforma=True
+    )
+    out_cn_cnt, out_cn_tax, st_cn = weclapp_sum_tax(
+        "salesCreditNote", df, dt, WECLAPP_SALES_TAX_FIELDS, sign=-1, ignore_proforma=True
+    )
+
+    ust_out = round(out_inv_tax + out_cn_tax, 2)
+    out_count = out_inv_cnt + out_cn_cnt
+
+    # Einkauf: Bestellungen (purchaseOrder) => Vorsteuerbetrag
+    in_po_cnt, in_po_tax, st_po = weclapp_sum_tax(
+        "purchaseOrder", df, dt, WECLAPP_INPUT_TAX_FIELDS, sign=+1, ignore_proforma=False
+    )
+    ust_in = round(in_po_tax, 2)
+    in_count = in_po_cnt
+
+    saldo = round(ust_out - ust_in, 2)
+
+    # CSV-Export für ZIP/Debug
+    pd.DataFrame([{
+        "date_from": date_from_str,
+        "date_to": date_to_str,
+        "salesInvoice_count_used": out_inv_cnt,
+        "salesInvoice_tax_sum": out_inv_tax,
+        "salesCreditNote_count_used": out_cn_cnt,
+        "salesCreditNote_tax_sum": out_cn_tax,
+        "purchaseOrder_count_used": in_po_cnt,
+        "purchaseOrder_input_tax_sum": in_po_tax,
+        "ust_out": ust_out,
+        "ust_in": ust_in,
+        "saldo": saldo,
+        "state_salesInvoice": st_inv,
+        "state_salesCreditNote": st_cn,
+        "state_purchaseOrder": st_po,
+        "note": "Verkauf: Umsatzsteuerbetrag (ohne Proforma). Einkauf: Vorsteuerbetrag aus Bestellungen."
+    }]).to_csv(OUTPUT_DIR / "weclapp_ust_summary.csv", sep=";", index=False, encoding="utf-8-sig")
+
+    return {
+        "ok": True,
+        "status": msg,
+        "date_from": date_from_str,
+        "date_to": date_to_str,
+        "out_count": out_count,
+        "in_count": in_count,
+        "ust_out": ust_out,
+        "ust_in": ust_in,
+        "saldo": saldo,
+        "hint": "Verkauf: Rechnungen/Gutschriften ohne Proforma (Umsatzsteuerbetrag). Einkauf: Bestellungen (Vorsteuerbetrag).",
+    }
+
+
+# ============================================================
+# DATEV MATCHING + KPI
 # ============================================================
 
 def run_analysis():
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    # ------------------ Kontoauszug ------------------
     konto = safe_read_csv(KONTOAUSZUG_CSV, sep=";")
 
-    amount_col = find_column(
-        konto,
-        ["umsatz (ohne soll/haben-kz)", "betrag", "umsatz", "betrag in eur"],
-        default=None
-    )
+    amount_col = find_column(konto, ["umsatz (ohne soll/haben-kz)", "betrag", "umsatz", "betrag in eur"], default=None)
     if not amount_col:
         raise ValueError("Konnte im Kontoauszug keine Betrags-Spalte finden.")
     konto["betrag_raw"] = konto[amount_col].apply(normalize_amount)
@@ -580,20 +672,12 @@ def run_analysis():
         raise ValueError("Konnte im Kontoauszug keine Datums-Spalte finden.")
     konto["datum_norm"] = pd.to_datetime(konto[date_col].apply(normalize_date), errors="coerce")
 
-    konto["text_gesamt"] = build_text_field(
-        konto,
-        ["buchungstext", "verwendungszweck", "name", "empfänger", "begünstigter", "auftraggeber"]
-    )
+    konto["text_gesamt"] = build_text_field(konto, ["buchungstext", "verwendungszweck", "name", "empfänger", "begünstigter", "auftraggeber"])
     konto["konto_index"] = konto.index
 
-    # ------------------ Belege ------------------
     belege = safe_read_csv(BELEGE_CSV, sep=";")
 
-    beleg_amount_col = find_column(
-        belege,
-        ["rechnungsbetrag", "bruttobetrag", "bruttowert", "brutto", "betrag"],
-        default=None
-    )
+    beleg_amount_col = find_column(belege, ["rechnungsbetrag", "bruttobetrag", "bruttowert", "brutto", "betrag"], default=None)
     if not beleg_amount_col:
         raise ValueError("Konnte in der Belegliste keine Brutto-Betrags-Spalte finden.")
     belege["betrag_raw"] = belege[beleg_amount_col].apply(normalize_amount)
@@ -604,20 +688,13 @@ def run_analysis():
     else:
         belege["datum_norm"] = pd.NaT
 
-    supplier_cols = [
-        c for c in belege.columns
-        if any(k in c.lower() for k in ["geschäftspartner-name", "geschaeftspartner-name", "lieferant", "name", "kunde"])
-    ]
-    invoice_cols = [
-        c for c in belege.columns
-        if any(k in c.lower() for k in ["rechnungs-nr", "rechnungsnummer", "interne re"])
-    ]
-    belege["supplier_text"] = belege.apply(lambda row: extract_supplier_text(row, supplier_cols, invoice_cols), axis=1)
+    supplier_cols = [c for c in belege.columns if any(k in c.lower() for k in ["geschäftspartner-name", "geschaeftspartner-name", "lieferant", "name", "kunde"])]
+    invoice_cols = [c for c in belege.columns if any(k in c.lower() for k in ["rechnungs-nr", "rechnungsnummer", "interne re"])]
 
+    belege["supplier_text"] = belege.apply(lambda row: extract_supplier_text(row, supplier_cols, invoice_cols), axis=1)
     invoice_main_col = find_column(belege, ["rechnungs-nr.", "rechnungsnummer"], default=None, prefer_contains="rechnungs")
     belege["invoice_number"] = belege[invoice_main_col] if invoice_main_col else ""
 
-    # Status
     status_col = find_column(belege, ["gebucht", "status", "belegstatus", "buchungsstatus"], default=None)
     if (not status_col) and STATUS_SPALTE_MANUELL and STATUS_SPALTE_MANUELL in belege.columns:
         status_col = STATUS_SPALTE_MANUELL
@@ -630,15 +707,14 @@ def run_analysis():
         belege["ist_gebucht"] = True
         belege["ist_posteingang"] = False
 
-    # KPI
+    # KPI (DATEV)
     belege, kpi_res = compute_vat_net_kpi(belege)
 
-    # ------------------ Matching ------------------
+    # Matching
     sichere_matches = []
     unklare_map = {}
     verwendete_konto_indices = set()
 
-    # 1) Gebuchte
     gebuchte = belege[belege["ist_gebucht"] == True].copy()
     for _, beleg in gebuchte.iterrows():
         betrag = beleg.get("betrag_raw", np.nan)
@@ -659,10 +735,8 @@ def run_analysis():
 
         sup_txt = beleg.get("supplier_text", "")
         inv_nr = beleg.get("invoice_number", "")
-
         candidates["score"] = candidates["text_gesamt"].apply(lambda t: score_match(t, sup_txt, inv_nr))
         candidates = candidates.sort_values(["score", "datum_diff_tage"], ascending=[False, True])
-
         best = candidates.iloc[0]
 
         if best["score"] >= 6 or (len(candidates) == 1 and best["score"] >= 1):
@@ -700,7 +774,6 @@ def run_analysis():
                     "score": c["score"],
                 })
 
-    # 2) Posteingang
     posteingang = belege[belege["ist_posteingang"] == True].copy()
     for _, beleg in posteingang.iterrows():
         betrag = beleg.get("betrag_raw", np.nan)
@@ -764,7 +837,6 @@ def run_analysis():
                 "beleg_rechnungsnr": inv_nr,
             })
 
-    # Unklare zusammenfassen
     unklare_faelle = []
     for _, data in unklare_map.items():
         kandidaten = data["kandidaten"]
@@ -793,59 +865,14 @@ def run_analysis():
             "konto_indices_scores": konto_scores_str,
         })
 
-    # Konto ohne Beleg / Kasse
     alle_verwendeten_konto = {m["konto_index"] for m in sichere_matches}
     for data in unklare_map.values():
         for k in data["kandidaten"]:
             alle_verwendeten_konto.add(k["konto_index"])
 
     konto_ohne_beleg = konto[~konto["konto_index"].isin(alle_verwendeten_konto)].copy()
-    konto_ohne_beleg["ist_kasse_vermutet"] = konto_ohne_beleg.apply(
-        lambda row: looks_like_cash_booking(row["text_gesamt"], row["betrag_raw"]),
-        axis=1
-    )
+    konto_ohne_beleg["ist_kasse_vermutet"] = konto_ohne_beleg.apply(lambda row: looks_like_cash_booking(row["text_gesamt"], row["betrag_raw"]), axis=1)
 
-    # Vorschläge Posteingang
-    vorschlaege = []
-    for _, beleg in posteingang.iterrows():
-        betrag = beleg.get("betrag_raw", np.nan)
-        datum = beleg.get("datum_norm", pd.NaT)
-        if pd.isna(betrag) or pd.isna(datum):
-            continue
-
-        betrag_abs = abs(float(betrag))
-        candidates = konto[(konto["betrag_raw"].abs().sub(betrag_abs).abs() <= (BETRAG_TOLERANZ * 2))].copy()
-        if candidates.empty:
-            continue
-
-        diff_days = (candidates["datum_norm"] - datum).dt.days.abs()
-        candidates["datum_diff_tage"] = diff_days
-        candidates = candidates[diff_days <= 60]
-        if candidates.empty:
-            continue
-
-        sup_txt = beleg.get("supplier_text", "")
-        inv_nr = beleg.get("invoice_number", "")
-
-        candidates["score"] = candidates["text_gesamt"].apply(lambda t: score_match(t, sup_txt, inv_nr))
-        candidates = candidates.sort_values(["score", "datum_diff_tage"], ascending=[False, True]).head(3)
-
-        for _, c in candidates.iterrows():
-            vorschlaege.append({
-                "beleg_index": beleg.name,
-                "beleg_datum": beleg.get("datum_norm", pd.NaT),
-                "beleg_betrag": beleg.get("betrag_raw", np.nan),
-                "beleg_supplier": sup_txt,
-                "beleg_rechnungsnr": inv_nr,
-                "konto_index": c["konto_index"],
-                "konto_datum": c["datum_norm"],
-                "konto_betrag": c["betrag_raw"],
-                "konto_text": c["text_gesamt"],
-                "datum_diff_tage": c["datum_diff_tage"],
-                "score": c["score"],
-            })
-
-    # Outputs
     df_sicher = pd.DataFrame(sichere_matches)
     df_unklar = pd.DataFrame(unklare_faelle)
 
@@ -861,19 +888,7 @@ def run_analysis():
 
     konto_ohne_beleg.to_csv(OUTPUT_DIR / "konto_ohne_beleg.csv", sep=";", index=False, encoding="utf-8-sig")
 
-    if vorschlaege:
-        pd.DataFrame(vorschlaege).to_csv(OUTPUT_DIR / "posteingang_kandidaten.csv", sep=";", index=False, encoding="utf-8-sig")
-
-    # Summary
-    anzahl_sicher = len(df_sicher)
-    anzahl_sicher_gebucht = len(df_sicher[df_sicher["typ"] == "gebucht"]) if not df_sicher.empty else 0
-    anzahl_sicher_post = len(df_sicher[df_sicher["typ"] == "posteingang"]) if not df_sicher.empty else 0
-
-    anzahl_unklar = len(df_unklar)
-    anzahl_fehlende = len(konto_ohne_beleg)
-    anzahl_kasse = int(konto_ohne_beleg["ist_kasse_vermutet"].sum()) if not konto_ohne_beleg.empty else 0
-
-    # Weclapp Status als CSV (kommt in ZIP)
+    # Weclapp Status CSV für ZIP
     ok, msg = weclapp_check_company()
     pd.DataFrame([{
         "configured_env": weclapp_configured(),
@@ -882,6 +897,13 @@ def run_analysis():
         "base_url": weclapp_base_url(),
         "token_set": bool(weclapp_token())
     }]).to_csv(OUTPUT_DIR / "weclapp_status.csv", sep=";", index=False, encoding="utf-8-sig")
+
+    anzahl_sicher = len(df_sicher)
+    anzahl_sicher_gebucht = len(df_sicher[df_sicher["typ"] == "gebucht"]) if not df_sicher.empty else 0
+    anzahl_sicher_post = len(df_sicher[df_sicher["typ"] == "posteingang"]) if not df_sicher.empty else 0
+    anzahl_unklar = len(df_unklar)
+    anzahl_fehlende = len(konto_ohne_beleg)
+    anzahl_kasse = int(konto_ohne_beleg["ist_kasse_vermutet"].sum()) if not konto_ohne_beleg.empty else 0
 
     return {
         "anzahl_sicher": anzahl_sicher,
@@ -895,29 +917,25 @@ def run_analysis():
         **kpi_res,
     }
 
-# ============================================================
-# WEB UI
-# ============================================================
 
-def format_eur(x) -> str:
-    try:
-        return f"{float(x):,.2f} €".replace(",", "X").replace(".", ",").replace("X", ".")
-    except Exception:
-        return "0,00 €"
+# ============================================================
+# UI
+# ============================================================
 
 @app.get("/", response_class=HTMLResponse)
 def index():
     ok, msg = weclapp_check_company()
-    status_badge = "✅ " + msg if ok else "⚠️ " + msg
+    status_badge = "✅ verbunden" if ok else f"⚠️ {msg}"
 
     today = datetime.now().date()
-    default_from = f"{today.year}-01-01"
-    default_to = f"{today.year}-03-31"
+    # default: aktuelles Quartal grob – hier Q4 als Beispiel
+    default_from = f"{today.year}-10-01"
+    default_to = f"{today.year}-12-31"
 
     return f"""
     <html>
       <head>
-        <title>NEXTWAVE Business Finance AI</title>
+        <title>NEXTWAVE AI Buchhaltung</title>
         <style>
           body {{ font-family: system-ui, -apple-system, Segoe UI, sans-serif; max-width: 900px; margin: 40px auto; padding: 0 16px; }}
           .logo {{ max-width: 260px; height: auto; margin-bottom: 10px; display:block; }}
@@ -931,29 +949,24 @@ def index():
           .dropzone.hover {{ border-color:#2563eb; background:#eff6ff; }}
           .filename {{ font-weight:600; margin-top:6px; }}
           .file-input {{ display:none; }}
-
-          /* Buttons */
-          button {{ padding:10px 18px; font-size:16px; border-radius:8px; border:none; cursor:pointer; color:white; }}
-          .btn-primary {{ background:#f15124; }}              /* ORANGE */
-          .btn-primary:hover {{ background:#d97706; }}
+          button {{ padding:10px 18px; font-size:16px; border-radius:8px; border:none; background:#2563eb; color:white; cursor:pointer; }}
+          button:hover {{ background:#1d4ed8; }}
           .btn-secondary {{ background:#111827; }}
           .btn-secondary:hover {{ background:#0b1220; }}
-
           .progress {{ margin-top:1rem; font-size:0.9rem; color:#2563eb; display:none; align-items:center; gap:8px; }}
           .progress.active {{ display:inline-flex; }}
           .spinner {{ width:18px; height:18px; border-radius:999px; border:3px solid #e5e7eb; border-top-color:#2563eb; animation: spin 0.8s linear infinite; }}
           @keyframes spin {{ from {{ transform: rotate(0deg);}} to {{ transform: rotate(360deg);}} }}
           .legal {{ margin-top:1.2rem; font-size:0.75rem; color:#777; line-height:1.4; }}
-          .status {{ font-size: 0.95rem; color:#374151; }}
         </style>
       </head>
       <body>
         <img src="/logo.png" alt="NEXTWAVE Logo" class="logo" />
-        <h1>Business Finance AI</h1>
+        <h1>NEXTWAVE AI Buchhaltung</h1>
         <p class="hint">
-          Willkommen bei deiner NEXTWAVE Business Finance AI!<br><br>
-          1) Zeitraum auswählen für automatische USt-Analyse über Weclapp.<br>
-          2) Kontoauszug + DATEV-Belege hochladen für Beleg- & Kontenabgleich inkl. Excel-Export.
+          Weclapp USt basiert auf:<br>
+          <strong>Verkauf → Rechnungen/Gutschriften (Umsatzsteuerbetrag, Proforma wird ignoriert)</strong><br>
+          <strong>Einkauf → Bestellungen (Vorsteuerbetrag)</strong>
         </p>
 
         <div class="box">
@@ -961,15 +974,15 @@ def index():
           <div class="row">
             <div>
               <label>Von</label>
-              <input type="date" id="date_from" name="date_from" value="{default_from}">
+              <input type="date" id="date_from" value="{default_from}">
             </div>
             <div>
               <label>Bis</label>
-              <input type="date" id="date_to" name="date_to" value="{default_to}">
+              <input type="date" id="date_to" value="{default_to}">
             </div>
           </div>
 
-          <div class="field status" style="margin-top:10px;">
+          <div class="field" style="color:#374151;">
             <strong>Weclapp:</strong> {status_badge}
           </div>
 
@@ -1002,7 +1015,7 @@ def index():
               <input class="file-input" type="file" name="belege_file" id="belege_file" accept=".csv" required />
             </div>
 
-            <button type="submit" id="submitBtn" class="btn-primary">DATEV Analyse starten</button>
+            <button type="submit" id="submitBtn">DATEV Analyse starten</button>
             <div id="progress" class="progress"><div class="spinner"></div><span>Analyse läuft …</span></div>
           </form>
         </div>
@@ -1020,7 +1033,6 @@ def index():
             const label = document.getElementById(labelId);
 
             drop.addEventListener('click', function(){{ input.click(); }});
-
             input.addEventListener('change', function(){{
               if (input.files && input.files.length > 0) label.textContent = input.files[0].name;
               else label.textContent = "Keine Datei ausgewählt";
@@ -1049,7 +1061,7 @@ def index():
             }});
           }}
 
-          function syncDatesToForms() {{
+          function syncDatesToWeclappForm() {{
             const df = document.getElementById('date_from').value;
             const dt = document.getElementById('date_to').value;
             document.getElementById('wf_from').value = df;
@@ -1060,15 +1072,15 @@ def index():
             setupDropzone('konto_drop','konto_file','konto_filename');
             setupDropzone('belege_drop','belege_file','belege_filename');
 
+            document.getElementById('date_from').addEventListener('change', syncDatesToWeclappForm);
+            document.getElementById('date_to').addEventListener('change', syncDatesToWeclappForm);
+            syncDatesToWeclappForm();
+
             const form = document.getElementById('uploadForm');
             const submitBtn = document.getElementById('submitBtn');
             const progress = document.getElementById('progress');
             const kontoInput = document.getElementById('konto_file');
             const belegeInput = document.getElementById('belege_file');
-
-            document.getElementById('date_from').addEventListener('change', syncDatesToForms);
-            document.getElementById('date_to').addEventListener('change', syncDatesToForms);
-            syncDatesToForms();
 
             form.addEventListener('submit', function(e){{
               if (!kontoInput.files.length || !belegeInput.files.length) {{
@@ -1086,100 +1098,133 @@ def index():
     </html>
     """
 
+
 @app.post("/weclapp-ust", response_class=HTMLResponse)
-async def weclapp_ust(
-    date_from: str = Form(""),
-    date_to: str = Form("")
-):
-    ok, msg = weclapp_check_company()
-
-    summary = None
-    err = None
-    if ok and date_from and date_to:
-        try:
-            summary = compute_weclapp_vat_summary(date_from, date_to)
-            if not summary.get("ok"):
-                err = summary.get("error")
-        except Exception as e:
-            err = str(e)
-
-    # CSV (optional)
+async def weclapp_ust(date_from: str = Form(""), date_to: str = Form("")):
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    pd.DataFrame([{
-        "date_from": date_from,
-        "date_to": date_to,
-        "configured_env": weclapp_configured(),
-        "api_ok": ok,
-        "status": msg,
-        "base_url": weclapp_base_url(),
-        "token_set": bool(weclapp_token()),
-        "weclapp_vat_ok": bool(summary and summary.get("ok")),
-        "error": err or ""
-    }]).to_csv(OUTPUT_DIR / "weclapp_status.csv", sep=";", index=False, encoding="utf-8-sig")
+    res = weclapp_ust_calc(date_from, date_to)
 
-    color = "#065f46" if ok else "#991b1b"
-    headline = "Weclapp OK" if ok else "Weclapp Problem"
+    badge = "verbunden" if res["ok"] else "problem"
+    badge_color = "#065f46" if res["ok"] else "#991b1b"
 
-    def fmt(x):
-        try:
-            return f"{float(x):,.2f} €".replace(",", "X").replace(".", ",").replace("X", ".")
-        except Exception:
-            return "0,00 €"
-
-    result_html = ""
-    if ok and date_from and date_to and summary and summary.get("ok"):
-        result_html = f"""
-          <h3 style="margin-top:18px;">USt-Auswertung (Weclapp)</h3>
-          <ul style="line-height:1.8; margin: 10px 0 0 0;">
-            <li><strong>USt (Ausgang):</strong> {fmt(summary.get('ust_ausgang'))}</li>
-            <li><strong>Vorsteuer (Eingang):</strong> {fmt(summary.get('vorsteuer'))}</li>
-            <li><strong>Saldo:</strong> {fmt(summary.get('saldo'))}</li>
-            <li style="margin-top:8px; color:#6b7280;">
-              Ausgangsrechnungen gezählt: {summary.get('out',{}).get('count',0)} |
-              Eingangsrechnungen gezählt: {summary.get('in',{}).get('count',0)}
-            </li>
-          </ul>
-        """
-    elif ok and date_from and date_to and err:
-        result_html = f"""
-          <div style="margin-top:16px; padding:12px; border-radius:10px; background:#fff7ed; border:1px solid #fed7aa; color:#9a3412;">
-            <strong>Hinweis:</strong> Verbindung steht, aber die USt-Auswertung konnte nicht berechnet werden.<br>
-            <span style="font-family: ui-monospace, SFMono-Regular, Menlo, monospace;">{err}</span>
-          </div>
-        """
-    elif ok:
-        result_html = """
-          <div style="margin-top:16px; color:#6b7280;">
-            Zeitraum fehlt – bitte auf der Startseite Von/Bis auswählen und erneut starten.
-          </div>
-        """
+    interpretation = "USt-Ausgeglichen"
+    if res["saldo"] > 0:
+        interpretation = "USt-Nachzahlung (Zahllast)"
+    elif res["saldo"] < 0:
+        interpretation = "USt-Erstattung (Überschuss)"
 
     return f"""
     <html>
       <head>
-        <title>{headline}</title>
+        <title>Weclapp OK</title>
         <style>
-          body {{ font-family: system-ui, -apple-system, Segoe UI, sans-serif; max-width: 860px; margin: 40px auto; padding: 0 16px; }}
-          .box {{ border:1px solid #e5e7eb; border-radius:12px; padding:14px; background:#fafafa; }}
-          .badge {{ display:inline-block; padding:6px 10px; border-radius:999px; background:{color}; color:white; font-weight:600; }}
+          body {{ font-family: system-ui, -apple-system, Segoe UI, sans-serif; max-width: 900px; margin: 40px auto; padding: 0 16px; }}
+          .card {{ border:1px solid #e5e7eb; border-radius:12px; padding:16px; background:#fafafa; }}
+          .badge {{ display:inline-block; padding:6px 10px; border-radius:999px; background:{badge_color}; color:white; font-weight:700; }}
+          ul {{ line-height: 1.8; }}
           a.button {{ display:inline-block; margin-top: 1.2rem; padding:10px 18px; background:#2563eb; color:#fff; text-decoration:none; border-radius:8px; }}
           a.button:hover {{ background:#1d4ed8; }}
+          .muted {{ color:#6b7280; }}
         </style>
       </head>
       <body>
-        <h1>{headline}</h1>
-        <div class="box">
-          <div class="badge">{msg}</div>
-          <p style="margin-top:12px; color:#374151;">
-            Zeitraum: <strong>{date_from or "–"}</strong> bis <strong>{date_to or "–"}</strong>
+        <h1>Weclapp OK</h1>
+        <div class="card">
+          <div class="badge">{badge}</div>
+          <p>Zeitraum: <strong>{res["date_from"]}</strong> bis <strong>{res["date_to"]}</strong></p>
+
+          <h3>USt-Auswertung (Weclapp)</h3>
+          <ul>
+            <li><strong>USt (Ausgang):</strong> {format_eur(res["ust_out"])} <span class="muted">(Umsatzsteuerbetrag)</span></li>
+            <li><strong>Vorsteuer (Eingang):</strong> {format_eur(res["ust_in"])} <span class="muted">(Vorsteuerbetrag aus Bestellungen)</span></li>
+            <li><strong>Saldo:</strong> {format_eur(res["saldo"])} <span class="muted">({interpretation})</span></li>
+          </ul>
+
+          <p class="muted">
+            Verkauf-Dokumente gezählt (ohne Proforma): {res["out_count"]} |
+            Bestellungen gezählt: {res["in_count"]}
           </p>
-          {result_html}
+
+          <p class="muted"><strong>{res.get("hint","")}</strong></p>
+
           <a class="button" href="/">Zurück</a>
         </div>
       </body>
     </html>
     """
 
+
+@app.post("/run", response_class=HTMLResponse)
+async def run(konto_file: UploadFile = File(...), belege_file: UploadFile = File(...)):
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    with open(KONTOAUSZUG_CSV, "wb") as f:
+        f.write(await konto_file.read())
+    with open(BELEGE_CSV, "wb") as f:
+        f.write(await belege_file.read())
+
+    res = run_analysis()
+
+    zip_path = OUTPUT_DIR / "datev_analyse_ergebnisse.zip"
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        for csv_file in OUTPUT_DIR.glob("*.csv"):
+            zf.write(csv_file, arcname=csv_file.name)
+
+    return f"""
+    <html>
+      <head>
+        <title>Analyse abgeschlossen</title>
+        <style>
+          body {{ font-family: system-ui, -apple-system, Segoe UI, sans-serif; max-width: 900px; margin: 40px auto; padding: 0 16px; }}
+          .box {{ border:1px solid #e5e7eb; border-radius:12px; padding:16px; background:#fafafa; margin-top:12px; }}
+          ul {{ line-height: 1.8; }}
+          a.button {{ display:inline-block; margin-top: 1.2rem; padding:10px 18px; background:#2563eb; color:#fff; text-decoration:none; border-radius:8px; }}
+          a.button:hover {{ background:#1d4ed8; }}
+          .legal {{ margin-top:2rem; font-size:0.75rem; color:#777; line-height:1.4; }}
+          code {{ background:#f3f4f6; padding:2px 6px; border-radius:6px; }}
+        </style>
+      </head>
+      <body>
+        <h1>Analyse abgeschlossen</h1>
+
+        <div class="box">
+          <h2>Matching</h2>
+          <ul>
+            <li><strong>Sichere Matches gesamt:</strong> {res['anzahl_sicher']}</li>
+            <li>&nbsp;&nbsp;&bull; davon gebuchte Belege: {res['anzahl_sicher_gebucht']}</li>
+            <li>&nbsp;&nbsp;&bull; davon Posteingang-Rechnungen: {res['anzahl_sicher_post']}</li>
+            <li><strong>Unklare Fälle:</strong> {res['anzahl_unklar']}</li>
+            <li><strong>Fehlende Belege gesamt:</strong> {res['anzahl_fehlende']}</li>
+            <li>&nbsp;&nbsp;&bull; davon Kassenbuchungen vermutet: {res['anzahl_kasse']}</li>
+          </ul>
+        </div>
+
+        <div class="box">
+          <h2>USt &amp; Betriebsergebnis (DATEV / Quartal)</h2>
+          <p style="color:#374151; margin-top:0;">
+            Details in der ZIP: <code>ust_betriebsergebnis.csv</code>, <code>ust_methoden_stats.csv</code>, <code>kpi_offen.csv</code>, <code>kpi_ignoriert.csv</code>.
+          </p>
+          <ul>
+            <li><strong>USt (Ausgang):</strong> {format_eur(res.get('ust_ausgang_sum',0))}</li>
+            <li><strong>Vorsteuer (Eingang):</strong> {format_eur(res.get('vorsteuer_sum',0))}</li>
+            <li><strong>USt-Saldo:</strong> {format_eur(res.get('ust_saldo',0))} <small>({res.get('ust_interpretation','')})</small></li>
+            <li><strong>Umsatz netto:</strong> {format_eur(res.get('umsatz_netto',0))}</li>
+            <li><strong>Kosten netto:</strong> {format_eur(res.get('kosten_netto',0))}</li>
+            <li><strong>Betriebsergebnis:</strong> {format_eur(res.get('betriebsergebnis',0))}</li>
+          </ul>
+        </div>
+
+        <a href="/download" class="button">Ergebnis-ZIP herunterladen</a>
+        <div style="margin-top:1rem;"><a href="/">Neue Analyse starten</a></div>
+
+        <div class="legal">
+          © NEXTWAVE GmbH – Alle Rechte vorbehalten.<br>
+          Die Nutzung dieses Programms oder von Teilen daraus ohne vorherige schriftliche Zustimmung der NEXTWAVE GmbH
+          ist untersagt und kann zivil- und strafrechtliche Schritte nach sich ziehen.
+        </div>
+      </body>
+    </html>
+    """
 
 @app.get("/download")
 def download_zip():
@@ -1193,5 +1238,4 @@ def logo():
     return FileResponse(BASE_DIR / "nextwave_logo.png", media_type="image/png")
 
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", "8080"))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    uvicorn.run(app, host="127.0.0.1", port=8000)
