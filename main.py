@@ -27,7 +27,7 @@ DATUM_FENSTER_TAGE = 30
 STATUS_SPALTE_MANUELL = None
 
 # Wenn True: schreibt debug_logs.txt in output/
-DEBUG = False
+DEBUG = True
 
 
 # ============================================================
