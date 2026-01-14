@@ -768,7 +768,6 @@ def index():
     </html>
     """
 
-
 @app.post("/run", response_class=HTMLResponse)
 async def run(konto_file: UploadFile = File(...), belege_file: UploadFile = File(...)):
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
