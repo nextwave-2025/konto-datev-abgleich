@@ -290,9 +290,18 @@ def run_analysis():
         if any(k in c.lower() for k in ["lieferant", "name", "adressat", "empfänger", "kunde", "geschäftspartner"])
     ]
     invoice_cols = [
-        c for c in belege.columns
-        if any(k in c.lower() for k in ["rechnungsnummer", "rechnungs-nr", "belegfeld 1", "belegfeld1"])
-    ]
+    c for c in belege.columns
+    if any(k in c.lower() for k in [
+        "rechnungsnummer", "rechnungs-nr", "rechnung nr", "invoice",
+        "belegfeld 1", "belegfeld1",
+        "referenz", "referenznr", "referenznummer",
+        "vorgang", "vorgangsnummer",
+        "kundenreferenz", "customer reference",
+        "mandatsreferenz", "mandat",
+        "payment reference", "verwendungszweck"
+    ])
+]
+
 
     belege["supplier_text"] = belege.apply(lambda row: extract_supplier_text(row, supplier_cols, invoice_cols), axis=1)
 
