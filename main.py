@@ -26,8 +26,7 @@ BETRAG_TOLERANZ = 0.01
 DATUM_FENSTER_TAGE = 30
 STATUS_SPALTE_MANUELL = None
 
-# Wenn True: schreibt debug_logs.txt in output/
-DEBUG = True
+DEBUG = True  # <- bei Bedarf auf False
 
 
 # ============================================================
@@ -69,12 +68,6 @@ def find_column(df, keywords, default=None, prefer_contains=None):
 
 
 def normalize_amount(x):
-    """
-    Robust gegen:
-    - NBSP / schmale Leerzeichen
-    - + / Minus am Ende (z.B. 1888,53-)
-    - Tausender-Trennzeichen . oder Leerzeichen
-    """
     if pd.isna(x):
         return np.nan
     if isinstance(x, (int, float, np.number)):
@@ -203,23 +196,16 @@ def pick_best_beleg_date_column(belege_df: pd.DataFrame) -> str | None:
     return None
 
 
-def normalize_for_invoice_search(s):
+def normalize_for_search(s):
     if s is None or (isinstance(s, float) and np.isnan(s)):
         return ""
     return re.sub(r"[^0-9a-z]", "", str(s).lower())
 
 
-def extract_refs_from_text_norm(text_norm: str):
-    """
-    Extrahiert plausible Referenz-/Vorgangsnummern aus bankseitigem Text.
-    Beispiel: Stadtwerke enthalten oft 7-12 stellige Nummern.
-    Wir nehmen nur längere Nummern, um Fehlmatches (z.B. Datum) zu reduzieren.
-    """
+def extract_refs(text_norm: str):
     if not text_norm:
         return []
-    # text_norm ist bereits nur [0-9a-z] => reine Ziffernsequenzen sind gut erkennbar
     nums = re.findall(r"\d{7,12}", text_norm)
-    # Duplikate entfernen, Reihenfolge behalten
     seen = set()
     out = []
     for n in nums:
@@ -258,18 +244,16 @@ def run_analysis():
         konto,
         ["buchungstext", "verwendungszweck", "name", "empfänger", "begünstigter", "auftraggeber"]
     )
-    konto["konto_index"] = konto.index
+    konto["konto_index"] = konto.index.astype(int)
     konto["text_norm"] = konto["text_gesamt"].apply(lambda x: re.sub(r"[^0-9a-z]", "", str(x).lower()))
 
-    # Ref Index: Referenznummer -> Liste Konto-Indizes
-    ref_to_konto_indices = {}
+    # Ref-Index Konto: ref -> [konto_index,...]
+    ref_to_konto = {}
     for _, row in konto.iterrows():
         kidx = int(row["konto_index"])
-        refs = extract_refs_from_text_norm(row.get("text_norm", ""))
-        for r in refs:
-            ref_to_konto_indices.setdefault(r, []).append(kidx)
-
-    dlog("Ref-Index Größe:", len(ref_to_konto_indices))
+        for r in extract_refs(row.get("text_norm", "")):
+            ref_to_konto.setdefault(r, []).append(kidx)
+    dlog("Ref-Index Konto Größe:", len(ref_to_konto))
 
     # ------------------ Belege ------------------
     belege = pd.read_csv(BELEGE_CSV, sep=";", dtype=str, encoding="latin1")
@@ -289,25 +273,37 @@ def run_analysis():
         c for c in belege.columns
         if any(k in c.lower() for k in ["lieferant", "name", "adressat", "empfänger", "kunde", "geschäftspartner"])
     ]
-    invoice_cols = [
-    c for c in belege.columns
-    if any(k in c.lower() for k in [
-        "rechnungsnummer", "rechnungs-nr", "rechnung nr", "invoice",
-        "belegfeld 1", "belegfeld1",
-        "referenz", "referenznr", "referenznummer",
-        "vorgang", "vorgangsnummer",
-        "kundenreferenz", "customer reference",
-        "mandatsreferenz", "mandat",
-        "payment reference", "verwendungszweck"
-    ])
-]
 
+    # erweitert
+    invoice_cols = [
+        c for c in belege.columns
+        if any(k in c.lower() for k in [
+            "rechnungsnummer", "rechnungs-nr", "rechnung nr", "invoice",
+            "belegfeld 1", "belegfeld1",
+            "referenz", "referenznr", "referenznummer",
+            "vorgang", "vorgangsnummer",
+            "kundenreferenz", "customer reference",
+            "mandatsreferenz", "mandat",
+            "payment reference", "verwendungszweck"
+        ])
+    ]
 
     belege["supplier_text"] = belege.apply(lambda row: extract_supplier_text(row, supplier_cols, invoice_cols), axis=1)
 
     beleg_invoice_col = invoice_cols[0] if invoice_cols else None
     belege["invoice_number"] = belege[beleg_invoice_col] if beleg_invoice_col else ""
-    belege["invoice_norm"] = belege["invoice_number"].apply(normalize_for_invoice_search)
+    belege["invoice_norm"] = belege["invoice_number"].apply(normalize_for_search)
+
+    # Ganz wichtig: „ALLE SPALTEN“-Text, um Referenzen überall zu finden
+    belege["text_all"] = belege.astype(str).agg(" ".join, axis=1)
+    belege["text_norm_all"] = belege["text_all"].apply(lambda x: re.sub(r"[^0-9a-z]", "", str(x).lower()))
+
+    # Ref-Index Belege: ref -> [beleg_index,...]
+    ref_to_beleg = {}
+    for idx, row in belege.iterrows():
+        for r in extract_refs(row.get("text_norm_all", "")):
+            ref_to_beleg.setdefault(r, []).append(idx)
+    dlog("Ref-Index Belege Größe:", len(ref_to_beleg))
 
     # ------------------ Status ------------------
     status_col = find_column(belege, ["gebucht", "status", "belegstatus", "buchungsstatus"], default=None)
@@ -322,21 +318,22 @@ def run_analysis():
         belege["ist_gebucht"] = True
         belege["ist_posteingang"] = False
 
-    # ------------------ Matching ------------------
+    # ------------------ Matching (Beleg -> Konto wie gehabt) ------------------
     sichere_matches = []
     unklare_map = {}
     verwendete_konto_indices = set()
+    verwendete_beleg_indices = set()
 
-    def add_unklar(beleg, kandidaten_rows, typ, base_score=0):
+    def add_unklar(beleg_idx, beleg_row, kandidaten_rows, typ, base_score=0):
         entry = unklare_map.setdefault(
-            beleg.name,
+            beleg_idx,
             {
                 "typ": typ,
-                "beleg_index": beleg.name,
-                "beleg_datum": beleg["datum_norm"],
-                "beleg_betrag": beleg["betrag_raw"],
-                "beleg_supplier": beleg["supplier_text"],
-                "beleg_rechnungsnr": beleg["invoice_number"],
+                "beleg_index": beleg_idx,
+                "beleg_datum": beleg_row["datum_norm"],
+                "beleg_betrag": beleg_row["betrag_raw"],
+                "beleg_supplier": beleg_row["supplier_text"],
+                "beleg_rechnungsnr": beleg_row["invoice_number"],
                 "kandidaten": [],
             },
         )
@@ -349,133 +346,18 @@ def run_analysis():
                 "score": int(c.get("score", base_score)),
             })
 
-    def try_invoice_fallback(beleg, typ):
-        """
-        Fallback 1: invoice_norm (aus Beleg) direkt im Banktext
-        Ergebnis:
-        - ("sicher", konto_index) oder ("unklar", [konto_indices]) oder (None, None)
-        """
-        inv = (beleg.get("invoice_norm") or "").strip()
-        if not inv or len(inv) < 4:
-            return (None, None)
-
-        inv_hits = konto[konto["text_norm"].str.contains(inv, na=False)].copy()
-        if inv_hits.empty:
-            return (None, None)
-
-        # Wenn 1 Treffer -> sicher, sonst unklar
-        if len(inv_hits) == 1:
-            kidx = int(inv_hits.iloc[0]["konto_index"])
-            if kidx in verwendete_konto_indices:
-                return (None, None)
-            return ("sicher", kidx)
-
-        return ("unklar", inv_hits)
-
-    def try_ref_fallback_from_invoice(beleg, typ):
-        """
-        Fallback 2: Falls invoice_norm selbst eine lange Nummer enthält (z.B. Referenz),
-        nutzen wir ref_to_konto_indices.
-        """
-        inv = (beleg.get("invoice_norm") or "").strip()
-        if not inv:
-            return (None, None)
-
-        # extrahiere lange Nummern aus invoice_norm (kann ja bereits "202551204" sein)
-        nums = re.findall(r"\d{7,12}", inv)
-        nums = list(dict.fromkeys(nums))  # unique preserve order
-        if not nums:
-            return (None, None)
-
-        all_hits = []
-        for n in nums:
-            hit_idxs = ref_to_konto_indices.get(n, [])
-            for kidx in hit_idxs:
-                all_hits.append(kidx)
-
-        all_hits = sorted(set(all_hits))
-        if not all_hits:
-            return (None, None)
-
-        if len(all_hits) == 1 and all_hits[0] not in verwendete_konto_indices:
-            return ("sicher", all_hits[0])
-
-        # unklar: mehrere Kontozeilen enthalten diese Ref
-        inv_hits = konto[konto["konto_index"].isin(all_hits)].copy()
-        return ("unklar", inv_hits)
-
     gebuchte = belege[belege["ist_gebucht"] == True].copy()
 
-    for _, beleg in gebuchte.iterrows():
+    for beleg_idx, beleg in gebuchte.iterrows():
         betrag = beleg["betrag_raw"]
         datum = beleg["datum_norm"]
-
         if pd.isna(betrag) or pd.isna(datum):
             continue
 
         betrag_abs = abs(betrag)
 
-        # 1) Betrag-Kandidaten (immer)
+        # 1) Betrag Kandidaten
         candidates = konto[(konto["betrag_raw"].abs().sub(betrag_abs).abs() <= BETRAG_TOLERANZ)].copy()
-
-        # 2) Fallbacks immer probieren (nicht nur bei candidates.empty)
-        #    -> wenn eindeutiger Treffer, direkt sichern
-        fb_kind, fb_res = try_invoice_fallback(beleg, "gebucht")
-        if fb_kind == "sicher":
-            kidx = fb_res
-            row = konto[konto["konto_index"] == kidx].iloc[0]
-            verwendete_konto_indices.add(kidx)
-            sichere_matches.append({
-                "typ": "gebucht",
-                "score": 999,
-                "konto_index": kidx,
-                "konto_datum": row["datum_norm"],
-                "konto_betrag": row["betrag_raw"],
-                "konto_text": row["text_gesamt"],
-                "beleg_index": beleg.name,
-                "beleg_datum": beleg["datum_norm"],
-                "beleg_betrag": beleg["betrag_raw"],
-                "beleg_supplier": beleg["supplier_text"],
-                "beleg_rechnungsnr": beleg["invoice_number"],
-            })
-            dlog("SICHER via invoice_fallback:", beleg.name, "->", kidx)
-            continue
-        elif fb_kind == "unklar":
-            # unklar via invoice hits: trotzdem als Kandidaten merken
-            inv_hits = fb_res
-            inv_hits["score"] = 500
-            add_unklar(beleg, inv_hits, "gebucht", base_score=500)
-            dlog("UNKLAR via invoice_fallback:", beleg.name, "hits:", len(inv_hits))
-            continue
-
-        fb_kind2, fb_res2 = try_ref_fallback_from_invoice(beleg, "gebucht")
-        if fb_kind2 == "sicher":
-            kidx = fb_res2
-            row = konto[konto["konto_index"] == kidx].iloc[0]
-            verwendete_konto_indices.add(kidx)
-            sichere_matches.append({
-                "typ": "gebucht",
-                "score": 900,
-                "konto_index": kidx,
-                "konto_datum": row["datum_norm"],
-                "konto_betrag": row["betrag_raw"],
-                "konto_text": row["text_gesamt"],
-                "beleg_index": beleg.name,
-                "beleg_datum": beleg["datum_norm"],
-                "beleg_betrag": beleg["betrag_raw"],
-                "beleg_supplier": beleg["supplier_text"],
-                "beleg_rechnungsnr": beleg["invoice_number"],
-            })
-            dlog("SICHER via ref_in_invoice_fallback:", beleg.name, "->", kidx)
-            continue
-        elif fb_kind2 == "unklar":
-            inv_hits = fb_res2
-            inv_hits["score"] = 400
-            add_unklar(beleg, inv_hits, "gebucht", base_score=400)
-            dlog("UNKLAR via ref_in_invoice_fallback:", beleg.name, "hits:", len(inv_hits))
-            continue
-
-        # 3) Wenn keine Betrag-Kandidaten, dann kann hier Schluss sein
         if candidates.empty:
             continue
 
@@ -490,9 +372,10 @@ def run_analysis():
         best = candidates.iloc[0]
         best_kidx = int(best["konto_index"])
 
-        if len(candidates) == 1:
+        if len(candidates) == 1 or int(best["score"]) >= 6:
             if best_kidx not in verwendete_konto_indices:
                 verwendete_konto_indices.add(best_kidx)
+                verwendete_beleg_indices.add(beleg_idx)
                 sichere_matches.append({
                     "typ": "gebucht",
                     "score": int(best["score"]),
@@ -500,73 +383,90 @@ def run_analysis():
                     "konto_datum": best["datum_norm"],
                     "konto_betrag": best["betrag_raw"],
                     "konto_text": best["text_gesamt"],
-                    "beleg_index": beleg.name,
-                    "beleg_datum": beleg["datum_norm"],
-                    "beleg_betrag": beleg["betrag_raw"],
-                    "beleg_supplier": beleg["supplier_text"],
-                    "beleg_rechnungsnr": beleg["invoice_number"],
-                })
-            continue
-
-        if int(best["score"]) >= 6:
-            if best_kidx not in verwendete_konto_indices:
-                verwendete_konto_indices.add(best_kidx)
-                sichere_matches.append({
-                    "typ": "gebucht",
-                    "score": int(best["score"]),
-                    "konto_index": best_kidx,
-                    "konto_datum": best["datum_norm"],
-                    "konto_betrag": best["betrag_raw"],
-                    "konto_text": best["text_gesamt"],
-                    "beleg_index": beleg.name,
+                    "beleg_index": beleg_idx,
                     "beleg_datum": beleg["datum_norm"],
                     "beleg_betrag": beleg["betrag_raw"],
                     "beleg_supplier": beleg["supplier_text"],
                     "beleg_rechnungsnr": beleg["invoice_number"],
                 })
         else:
-            add_unklar(beleg, candidates, "gebucht", base_score=0)
+            add_unklar(beleg_idx, beleg, candidates, "gebucht", base_score=0)
 
-    # Posteingang bleibt wie gehabt (optional)
-    posteingang = belege[belege["ist_posteingang"] == True].copy()
-    for _, beleg in posteingang.iterrows():
-        betrag = beleg["betrag_raw"]
-        datum = beleg["datum_norm"]
-        if pd.isna(betrag) or pd.isna(datum):
+    # ------------------ Reverse Ref Matching (Konto -> Beleg über Referenz) ------------------
+    # Damit verschwinden Stadtwerke & Co aus konto_ohne_beleg, auch wenn Ref nicht in invoice_cols steckt.
+    ref_kandidaten_rows = []
+
+    # nur Konten, die bisher NICHT verwendet wurden
+    remaining_konto = konto[~konto["konto_index"].isin(verwendete_konto_indices)].copy()
+
+    for _, krow in remaining_konto.iterrows():
+        kidx = int(krow["konto_index"])
+        krefs = extract_refs(krow.get("text_norm", ""))
+
+        if not krefs:
             continue
 
-        betrag_abs = abs(betrag)
-        candidates = konto[(konto["betrag_raw"].abs().sub(betrag_abs).abs() <= BETRAG_TOLERANZ)].copy()
-        if candidates.empty:
+        # Sammle alle Belege, die eine dieser Referenzen irgendwo im Text haben
+        beleg_hits = []
+        hit_ref = None
+        for r in krefs:
+            if r in ref_to_beleg:
+                beleg_hits.extend(ref_to_beleg[r])
+                hit_ref = r  # nur fürs Logging
+        beleg_hits = sorted(set(beleg_hits))
+
+        if not beleg_hits:
             continue
 
-        candidates["datum_diff_tage"] = (candidates["datum_norm"] - datum).dt.days.abs()
-        candidates = candidates[candidates["datum_diff_tage"] <= DATUM_FENSTER_TAGE]
-        if candidates.empty:
-            continue
+        # Wenn genau 1 Beleg -> sicher matchen (wenn Konto noch frei)
+        if len(beleg_hits) == 1:
+            bidx = beleg_hits[0]
+            if bidx in verwendete_beleg_indices:
+                # Beleg schon anders gematcht -> trotzdem Konto markieren, damit nicht in "ohne_beleg" bleibt
+                verwendete_konto_indices.add(kidx)
+                ref_kandidaten_rows.append({
+                    "konto_index": kidx,
+                    "konto_datum": krow["datum_norm"],
+                    "konto_betrag": krow["betrag_raw"],
+                    "konto_text": krow["text_gesamt"],
+                    "ref": hit_ref,
+                    "beleg_index": bidx,
+                    "hinweis": "Beleg bereits gematcht – Konto nur entfernt (Ref erkannt)"
+                })
+                continue
 
-        sup_txt = beleg["supplier_text"]
-        inv_nr = beleg["invoice_number"]
-        candidates["score"] = candidates["text_gesamt"].apply(lambda t: score_match(t, sup_txt, inv_nr))
-        candidates = candidates.sort_values(["score", "datum_diff_tage"], ascending=[False, True])
+            brow = belege.loc[bidx]
+            verwendete_konto_indices.add(kidx)
+            verwendete_beleg_indices.add(bidx)
 
-        best = candidates.iloc[0]
-        best_kidx = int(best["konto_index"])
-        if best_kidx not in verwendete_konto_indices:
-            verwendete_konto_indices.add(best_kidx)
+            typ = "gebucht" if bool(brow.get("ist_gebucht", True)) else "posteingang"
             sichere_matches.append({
-                "typ": "posteingang",
-                "score": int(best["score"]),
-                "konto_index": best_kidx,
-                "konto_datum": best["datum_norm"],
-                "konto_betrag": best["betrag_raw"],
-                "konto_text": best["text_gesamt"],
-                "beleg_index": beleg.name,
-                "beleg_datum": beleg["datum_norm"],
-                "beleg_betrag": beleg["betrag_raw"],
-                "beleg_supplier": beleg["supplier_text"],
-                "beleg_rechnungsnr": beleg["invoice_number"],
+                "typ": f"ref_reverse_{typ}",
+                "score": 850,
+                "konto_index": kidx,
+                "konto_datum": krow["datum_norm"],
+                "konto_betrag": krow["betrag_raw"],
+                "konto_text": krow["text_gesamt"],
+                "beleg_index": bidx,
+                "beleg_datum": brow.get("datum_norm", pd.NaT),
+                "beleg_betrag": brow.get("betrag_raw", np.nan),
+                "beleg_supplier": brow.get("supplier_text", ""),
+                "beleg_rechnungsnr": brow.get("invoice_number", ""),
             })
+            dlog("SICHER via REF_REVERSE:", "konto", kidx, "ref", hit_ref, "-> beleg", bidx)
+        else:
+            # Mehrere Belege -> unklar, aber Konto muss aus "ohne_beleg" raus
+            verwendete_konto_indices.add(kidx)
+            ref_kandidaten_rows.append({
+                "konto_index": kidx,
+                "konto_datum": krow["datum_norm"],
+                "konto_betrag": krow["betrag_raw"],
+                "konto_text": krow["text_gesamt"],
+                "ref": hit_ref,
+                "beleg_indices": ",".join(str(x) for x in beleg_hits),
+                "hinweis": "Mehrere Belege zur Referenz – Konto entfernt, bitte manuell prüfen"
+            })
+            dlog("UNKLAR via REF_REVERSE:", "konto", kidx, "ref", hit_ref, "belege", len(beleg_hits))
 
     # ------------------ Unklare zusammenfassen ------------------
     unklare_faelle = []
@@ -598,12 +498,14 @@ def run_analysis():
         })
 
     # ------------------ Konto ohne Beleg ------------------
-    alle_verwendeten_konto = {int(m["konto_index"]) for m in sichere_matches}
+    alle_verwendeten_konto = set(int(m["konto_index"]) for m in sichere_matches)
 
-    # Wichtig: auch unklare Kandidaten entfernen (damit Stadtwerke etc. nicht in konto_ohne_beleg bleiben)
     for data in unklare_map.values():
         for k in data["kandidaten"]:
             alle_verwendeten_konto.add(int(k["konto_index"]))
+
+    # Dazu: verwendete_konto_indices (inkl. reverse-ref)
+    alle_verwendeten_konto.update(set(int(x) for x in verwendete_konto_indices))
 
     konto_ohne_beleg = konto[~konto["konto_index"].isin(alle_verwendeten_konto)].copy()
     konto_ohne_beleg["ist_kasse_vermutet"] = konto_ohne_beleg.apply(
@@ -614,6 +516,7 @@ def run_analysis():
     # ------------------ CSV-Ausgaben ------------------
     df_sicher = pd.DataFrame(sichere_matches)
     df_unklar = pd.DataFrame(unklare_faelle)
+    df_ref_kand = pd.DataFrame(ref_kandidaten_rows)
 
     if not df_sicher.empty:
         df_sicher.to_csv(OUTPUT_DIR / "matches_sicher.csv", sep=";", index=False, encoding="utf-8-sig")
@@ -625,14 +528,20 @@ def run_analysis():
     else:
         (OUTPUT_DIR / "matches_unklar.csv").write_text("keine unklaren Fälle gefunden", encoding="utf-8")
 
+    if not df_ref_kand.empty:
+        df_ref_kand.to_csv(OUTPUT_DIR / "konto_ref_kandidaten.csv", sep=";", index=False, encoding="utf-8-sig")
+    else:
+        # optional: nicht erzeugen oder leer schreiben
+        (OUTPUT_DIR / "konto_ref_kandidaten.csv").write_text("keine ref-kandidaten", encoding="utf-8")
+
     konto_ohne_beleg.to_csv(OUTPUT_DIR / "konto_ohne_beleg.csv", sep=";", index=False, encoding="utf-8-sig")
 
     if DEBUG:
         (OUTPUT_DIR / "debug_logs.txt").write_text("\n".join(debug_lines), encoding="utf-8")
 
     anzahl_sicher = len(df_sicher) if not df_sicher.empty else 0
-    anzahl_sicher_gebucht = len(df_sicher[df_sicher["typ"] == "gebucht"]) if not df_sicher.empty else 0
-    anzahl_sicher_post = len(df_sicher[df_sicher["typ"] == "posteingang"]) if not df_sicher.empty else 0
+    anzahl_sicher_gebucht = len(df_sicher[df_sicher["typ"].astype(str).str.contains("gebucht")]) if not df_sicher.empty else 0
+    anzahl_sicher_post = len(df_sicher[df_sicher["typ"].astype(str).str.contains("posteingang")]) if not df_sicher.empty else 0
     anzahl_unklar = len(df_unklar) if not df_unklar.empty else 0
     anzahl_fehlende = len(konto_ohne_beleg)
     anzahl_kasse = int(konto_ohne_beleg["ist_kasse_vermutet"].sum()) if not konto_ohne_beleg.empty else 0
@@ -777,6 +686,7 @@ def index():
     </html>
     """
 
+
 @app.post("/run", response_class=HTMLResponse)
 async def run(konto_file: UploadFile = File(...), belege_file: UploadFile = File(...)):
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -790,14 +700,9 @@ async def run(konto_file: UploadFile = File(...), belege_file: UploadFile = File
 
     zip_path = OUTPUT_DIR / "datev_analyse_ergebnisse.zip"
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-        # CSVs rein
-        for file in OUTPUT_DIR.glob("*.csv"):
-            zf.write(file, arcname=file.name)
-
-        # Debug-Log rein, falls vorhanden
-        dbg = OUTPUT_DIR / "debug_logs.txt"
-        if dbg.exists():
-            zf.write(dbg, arcname=dbg.name)
+        for file in OUTPUT_DIR.iterdir():
+            if file.is_file() and file.suffix.lower() in [".csv", ".txt"]:
+                zf.write(file, arcname=file.name)
 
     return f"""
     <html>
