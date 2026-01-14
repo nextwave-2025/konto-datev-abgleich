@@ -782,8 +782,14 @@ async def run(konto_file: UploadFile = File(...), belege_file: UploadFile = File
 
     zip_path = OUTPUT_DIR / "datev_analyse_ergebnisse.zip"
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-        for csv_file in OUTPUT_DIR.glob("*.csv"):
-            zf.write(csv_file, arcname=csv_file.name)
+        # CSVs rein
+        for file in OUTPUT_DIR.glob("*.csv"):
+            zf.write(file, arcname=file.name)
+
+        # Debug-Log rein, falls vorhanden
+        dbg = OUTPUT_DIR / "debug_logs.txt"
+        if dbg.exists():
+            zf.write(dbg, arcname=dbg.name)
 
     return f"""
     <html>
