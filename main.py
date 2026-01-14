@@ -43,13 +43,11 @@ def find_column(df, keywords, default=None, prefer_contains=None):
     cols = list(df.columns)
     cols_lower = [c.lower() for c in cols]
 
-    # 1) exakte Treffer
     for key in keywords:
         for orig, low in zip(cols, cols_lower):
             if key == low:
                 return orig
 
-    # 2) Teilzeichenfolge
     candidates = []
     for key in keywords:
         for orig, low in zip(cols, cols_lower):
@@ -68,13 +66,38 @@ def find_column(df, keywords, default=None, prefer_contains=None):
 
 
 def normalize_amount(x):
+    """
+    Robust gegen:
+    - NBSP / schmale Leerzeichen
+    - + / Minus am Ende (z.B. 1888,53-)
+    - Tausender-Trennzeichen . oder Leerzeichen
+    """
     if pd.isna(x):
         return np.nan
     if isinstance(x, (int, float, np.number)):
         return float(x)
-    s = str(x).strip().replace(" ", "")
-    s = s.replace("€", "")
-    s = s.replace(".", "").replace(",", ".")  # DE -> float
+
+    s = str(x)
+    if not s.strip():
+        return np.nan
+
+    # Sonder-Leerzeichen entfernen
+    s = s.replace("\u00a0", "").replace("\u202f", "").replace(" ", "")
+
+    # Euro & Plus entfernen
+    s = s.replace("€", "").replace("+", "")
+
+    # Minus am Ende -> Minus vorne
+    if s.endswith("-"):
+        s = "-" + s[:-1]
+
+    # Nur erlaubte Zeichen lassen (Ziffern, - , . , ,)
+    s = re.sub(r"[^0-9\-\.,]", "", s)
+
+    # DE-Schreibweise -> float
+    # Tausenderpunkte entfernen, Komma zu Punkt
+    s = s.replace(".", "").replace(",", ".")
+
     try:
         return float(s)
     except ValueError:
@@ -122,16 +145,14 @@ def extract_supplier_text(row, supplier_cols, invoice_cols):
 
 def clean_tokens(text):
     text = re.sub(r"[^a-z0-9äöüß ]", " ", str(text).lower())
-    tokens = [t for t in text.split() if len(t) >= 4]
-    return tokens
+    return [t for t in text.split() if len(t) >= 4]
 
 
 def score_match(konto_text, beleg_supplier_text, invoice_number):
     konto_text_norm = re.sub(r"[^a-zA-Z0-9]", "", str(konto_text).lower())
     score = 0
 
-    supplier_tokens = clean_tokens(beleg_supplier_text)
-    for t in supplier_tokens:
+    for t in clean_tokens(beleg_supplier_text):
         if t in str(konto_text).lower():
             score += 1
 
@@ -159,49 +180,39 @@ def looks_like_cash_booking(konto_text, amount):
     text = str(konto_text).lower()
     kasse_keywords = [
         "edeka", "rewe", "netto", "aldi", "lidl", "penny",
-        "kaufland", "denn", "dm ", "rossmann", "apotheke",
+        "kaufland", "denn", "dm", "rossmann", "apotheke",
         "tankstelle", "shell", "aral", "esso", "omv", "bft",
-        "pos ", "kartenzahlung", "ec-zahlung", "maestro", "visa",
+        "pos", "kartenzahlung", "ec-zahlung", "maestro", "visa",
         "mastercard"
     ]
-
-    if any(kw in text for kw in kasse_keywords) and (amount is not None):
+    if any(kw in text for kw in kasse_keywords):
         try:
             amt = float(amount)
         except Exception:
             return False
-        if abs(amt) <= 300:
-            return True
+        return abs(amt) <= 300
     return False
 
 
-# ============================================================
-# NEU: BELEG-DATUM ROBUST ERMITTELN (Rechnungsdatum > Belegdatum > Leistungsdatum > Eingangsdatum)
-# ============================================================
-
 def pick_best_beleg_date_column(belege_df: pd.DataFrame) -> str | None:
-    cols_lower = {c.lower(): c for c in belege_df.columns}
-
-    # harte Priorität
-    priority_patterns = [
-        ("rechnungsdatum", ["rechnungsdatum", "rechnungsdat", "invoice date"]),
-        ("belegdatum",     ["belegdatum", "beleg-datum"]),
-        ("leistungsdatum", ["leistungsdatum", "leistungsdat"]),
-    ]
-
-    for _, keys in priority_patterns:
+    # Priorität: Rechnungsdatum -> Belegdatum -> Leistungsdatum -> Eingangsdatum -> irgendein Datum
+    for keys in [
+        ["rechnungsdatum", "rechnungsdat"],
+        ["belegdatum"],
+        ["leistungsdatum", "leistungsdat"],
+        ["eingangsdatum", "eingangsdat", "eingangsd"],
+        ["datum"],
+    ]:
         c = find_column(belege_df, keys, default=None)
         if c:
             return c
+    return None
 
-    # Eingangsdatum wirklich nur als Fallback
-    c = find_column(belege_df, ["eingangsdatum", "eingangsdat", "eingangsd"], default=None)
-    if c:
-        return c
 
-    # letzte Chance: irgendein "datum" – aber das ist genau die Fehlerquelle, deshalb wirklich nur zuletzt
-    c = find_column(belege_df, ["datum"], default=None)
-    return c
+def normalize_for_invoice_search(s):
+    if s is None or (isinstance(s, float) and np.isnan(s)):
+        return ""
+    return re.sub(r"[^0-9a-z]", "", str(s).lower())
 
 
 # ============================================================
@@ -211,14 +222,10 @@ def pick_best_beleg_date_column(belege_df: pd.DataFrame) -> str | None:
 def run_analysis():
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    # ------------------ Kontoauszug einlesen ------------------
+    # ------------------ Kontoauszug ------------------
     konto = pd.read_csv(KONTOAUSZUG_CSV, sep=";", dtype=str, encoding="latin1")
 
-    amount_col = find_column(
-        konto,
-        ["umsatz (ohne soll/haben-kz)", "betrag", "umsatz", "betrag in eur"],
-        default=None
-    )
+    amount_col = find_column(konto, ["umsatz (ohne soll/haben-kz)", "betrag", "umsatz", "betrag in eur"], default=None)
     if not amount_col:
         raise ValueError("Konnte im Kontoauszug keine Betrags-Spalte finden.")
     konto["betrag_raw"] = konto[amount_col].apply(normalize_amount)
@@ -226,32 +233,26 @@ def run_analysis():
     date_col = find_column(konto, ["buchungstag", "buchungsdatum", "datum"], default=None)
     if not date_col:
         raise ValueError("Konnte im Kontoauszug keine Datums-Spalte finden.")
-    konto["datum_norm"] = konto[date_col].apply(normalize_date)
-    konto["datum_norm"] = pd.to_datetime(konto["datum_norm"], errors="coerce")
+    konto["datum_norm"] = pd.to_datetime(konto[date_col].apply(normalize_date), errors="coerce")
 
     konto["text_gesamt"] = build_text_field(
         konto,
         ["buchungstext", "verwendungszweck", "name", "empfänger", "begünstigter", "auftraggeber"]
     )
     konto["konto_index"] = konto.index
+    konto["text_norm"] = konto["text_gesamt"].apply(lambda x: re.sub(r"[^0-9a-z]", "", str(x).lower()))
 
-    # ------------------ Belege einlesen ------------------
+    # ------------------ Belege ------------------
     belege = pd.read_csv(BELEGE_CSV, sep=";", dtype=str, encoding="latin1")
 
-    beleg_amount_col = find_column(
-        belege,
-        ["bruttobetrag", "bruttowert", "rechnungsbetrag", "betrag"],
-        default=None
-    )
+    beleg_amount_col = find_column(belege, ["betrag", "rechnungsbetrag", "bruttobetrag", "bruttowert"], default=None)
     if not beleg_amount_col:
         raise ValueError("Konnte in der Belegliste keine Brutto-Betrags-Spalte finden.")
     belege["betrag_raw"] = belege[beleg_amount_col].apply(normalize_amount)
 
-    # ✅ FIX: korrektes Datum wählen
     beleg_date_col = pick_best_beleg_date_column(belege)
     if beleg_date_col:
-        belege["datum_norm"] = belege[beleg_date_col].apply(normalize_date)
-        belege["datum_norm"] = pd.to_datetime(belege["datum_norm"], errors="coerce")
+        belege["datum_norm"] = pd.to_datetime(belege[beleg_date_col].apply(normalize_date), errors="coerce")
     else:
         belege["datum_norm"] = pd.NaT
 
@@ -261,28 +262,22 @@ def run_analysis():
     ]
     invoice_cols = [
         c for c in belege.columns
-        if any(k in c.lower() for k in ["rechnungsnummer", "rechnungs-nr", "belegfeld 1", "belegfeld1", "rechnungs-nr."])
+        if any(k in c.lower() for k in ["rechnungsnummer", "rechnungs-nr", "belegfeld 1", "belegfeld1"])
     ]
 
-    belege["supplier_text"] = belege.apply(
-        lambda row: extract_supplier_text(row, supplier_cols, invoice_cols),
-        axis=1
-    )
+    belege["supplier_text"] = belege.apply(lambda row: extract_supplier_text(row, supplier_cols, invoice_cols), axis=1)
+
     beleg_invoice_col = invoice_cols[0] if invoice_cols else None
     belege["invoice_number"] = belege[beleg_invoice_col] if beleg_invoice_col else ""
+    belege["invoice_norm"] = belege["invoice_number"].apply(normalize_for_invoice_search)
 
-    # ------------------ Status erkennen ------------------
-    status_col = find_column(
-        belege,
-        ["gebucht", "status", "verarbeitungsstatus", "belegstatus", "buchungsstatus"],
-        default=None
-    )
+    # ------------------ Status ------------------
+    status_col = find_column(belege, ["gebucht", "status", "belegstatus", "buchungsstatus"], default=None)
     if (not status_col) and STATUS_SPALTE_MANUELL and STATUS_SPALTE_MANUELL in belege.columns:
         status_col = STATUS_SPALTE_MANUELL
 
     if status_col:
         status_lower = belege[status_col].astype(str).str.lower().str.strip()
-        # ✅ bei dir ist es "ja" (passt) – wir lassen es so, aber robust gegen "true/1/x"
         belege["ist_gebucht"] = status_lower.isin(["ja", "true", "1", "x", "gebucht"])
         belege["ist_posteingang"] = ~belege["ist_gebucht"]
     else:
@@ -299,38 +294,76 @@ def run_analysis():
     for _, beleg in gebuchte.iterrows():
         betrag = beleg["betrag_raw"]
         datum = beleg["datum_norm"]
+
         if pd.isna(betrag) or pd.isna(datum):
             continue
 
         betrag_abs = abs(betrag)
 
-        candidates = konto[
-            (konto["betrag_raw"].abs().sub(betrag_abs).abs() <= BETRAG_TOLERANZ)
-        ].copy()
+        # 1) Primär: Betrag-Matching
+        candidates = konto[(konto["betrag_raw"].abs().sub(betrag_abs).abs() <= BETRAG_TOLERANZ)].copy()
+
+        # ✅ 2) Fallback: Rechnungsnummer direkt im Banktext suchen (wenn Betrag-Matching nichts findet)
+        if candidates.empty and beleg.get("invoice_norm"):
+            inv = beleg["invoice_norm"]
+            if inv and len(inv) >= 4:
+                inv_hits = konto[konto["text_norm"].str.contains(inv, na=False)].copy()
+                # Wenn eindeutig genau 1 Treffer -> direkt sicher matchen
+                if len(inv_hits) == 1:
+                    best = inv_hits.iloc[0]
+                    if best["konto_index"] not in verwendete_konto_indices:
+                        verwendete_konto_indices.add(best["konto_index"])
+                        sichere_matches.append({
+                            "typ": "gebucht",
+                            "score": 999,
+                            "konto_index": best["konto_index"],
+                            "konto_datum": best["datum_norm"],
+                            "konto_betrag": best["betrag_raw"],
+                            "konto_text": best["text_gesamt"],
+                            "beleg_index": beleg.name,
+                            "beleg_datum": beleg["datum_norm"],
+                            "beleg_betrag": beleg["betrag_raw"],
+                            "beleg_supplier": beleg["supplier_text"],
+                            "beleg_rechnungsnr": beleg["invoice_number"],
+                        })
+                    continue
+                # Wenn mehrere Treffer -> unklar
+                elif len(inv_hits) > 1:
+                    entry = unklare_map.setdefault(
+                        beleg.name,
+                        {
+                            "typ": "gebucht",
+                            "beleg_index": beleg.name,
+                            "beleg_datum": beleg["datum_norm"],
+                            "beleg_betrag": beleg["betrag_raw"],
+                            "beleg_supplier": beleg["supplier_text"],
+                            "beleg_rechnungsnr": beleg["invoice_number"],
+                            "kandidaten": [],
+                        },
+                    )
+                    for _, c in inv_hits.iterrows():
+                        entry["kandidaten"].append({
+                            "konto_index": c["konto_index"],
+                            "konto_datum": c["datum_norm"],
+                            "konto_betrag": c["betrag_raw"],
+                            "konto_text": c["text_gesamt"],
+                            "score": 500,
+                        })
+                    continue
 
         if candidates.empty:
             continue
 
-        # ✅ FIX: kein harter Cut bei 45 Tagen, sondern nur Ranking nach Datum
-        diff_days = (candidates["datum_norm"] - datum).dt.days.abs()
-        candidates["datum_diff_tage"] = diff_days
+        candidates["datum_diff_tage"] = (candidates["datum_norm"] - datum).dt.days.abs()
 
         sup_txt = beleg["supplier_text"]
         inv_nr = beleg["invoice_number"]
 
-        candidates["score"] = candidates["text_gesamt"].apply(
-            lambda t: score_match(t, sup_txt, inv_nr)
-        )
-
-        # Sortiere: zuerst Score, dann Datum
-        candidates = candidates.sort_values(
-            ["score", "datum_diff_tage"],
-            ascending=[False, True]
-        )
+        candidates["score"] = candidates["text_gesamt"].apply(lambda t: score_match(t, sup_txt, inv_nr))
+        candidates = candidates.sort_values(["score", "datum_diff_tage"], ascending=[False, True])
 
         best = candidates.iloc[0]
 
-        # ✅ FIX: Wenn es nur EINEN Betragstreffer gibt -> direkt matchen (auch wenn Score 0)
         if len(candidates) == 1:
             if best["konto_index"] not in verwendete_konto_indices:
                 verwendete_konto_indices.add(best["konto_index"])
@@ -349,8 +382,7 @@ def run_analysis():
                 })
             continue
 
-        # Ansonsten wie bisher: sichere Schwellen
-        if best["score"] >= 6 or best["datum_diff_tage"] <= 3:
+        if best["score"] >= 6:
             if best["konto_index"] not in verwendete_konto_indices:
                 verwendete_konto_indices.add(best["konto_index"])
                 sichere_matches.append({
@@ -386,12 +418,10 @@ def run_analysis():
                     "konto_betrag": c["betrag_raw"],
                     "konto_text": c["text_gesamt"],
                     "score": c["score"],
-                    "datum_diff_tage": c["datum_diff_tage"],
                 })
 
-    # Posteingang unverändert (Datum-Fenster bleibt enger)
+    # Posteingang bleibt wie gehabt (optional)
     posteingang = belege[belege["ist_posteingang"] == True].copy()
-
     for _, beleg in posteingang.iterrows():
         betrag = beleg["betrag_raw"]
         datum = beleg["datum_norm"]
@@ -399,62 +429,21 @@ def run_analysis():
             continue
 
         betrag_abs = abs(betrag)
-        candidates = konto[
-            (konto["betrag_raw"].abs().sub(betrag_abs).abs() <= BETRAG_TOLERANZ)
-        ].copy()
-
+        candidates = konto[(konto["betrag_raw"].abs().sub(betrag_abs).abs() <= BETRAG_TOLERANZ)].copy()
         if candidates.empty:
             continue
 
-        diff_days = (candidates["datum_norm"] - datum).dt.days.abs()
-        candidates["datum_diff_tage"] = diff_days
-        candidates = candidates[diff_days <= DATUM_FENSTER_TAGE]
-
+        candidates["datum_diff_tage"] = (candidates["datum_norm"] - datum).dt.days.abs()
+        candidates = candidates[candidates["datum_diff_tage"] <= DATUM_FENSTER_TAGE]
         if candidates.empty:
             continue
 
         sup_txt = beleg["supplier_text"]
         inv_nr = beleg["invoice_number"]
-
-        candidates["score"] = candidates["text_gesamt"].apply(
-            lambda t: score_match(t, sup_txt, inv_nr)
-        )
-
-        candidates = candidates.sort_values(
-            ["score", "datum_diff_tage"],
-            ascending=[False, True]
-        )
+        candidates["score"] = candidates["text_gesamt"].apply(lambda t: score_match(t, sup_txt, inv_nr))
+        candidates = candidates.sort_values(["score", "datum_diff_tage"], ascending=[False, True])
 
         best = candidates.iloc[0]
-        second_score = candidates.iloc[1]["score"] if len(candidates) > 1 else None
-
-        if len(candidates) > 1 and (
-            best["score"] <= 0 or
-            (second_score is not None and (best["score"] - second_score) < 2)
-        ):
-            entry = unklare_map.setdefault(
-                beleg.name,
-                {
-                    "typ": "posteingang",
-                    "beleg_index": beleg.name,
-                    "beleg_datum": beleg["datum_norm"],
-                    "beleg_betrag": beleg["betrag_raw"],
-                    "beleg_supplier": beleg["supplier_text"],
-                    "beleg_rechnungsnr": beleg["invoice_number"],
-                    "kandidaten": [],
-                },
-            )
-            for _, c in candidates.iterrows():
-                entry["kandidaten"].append({
-                    "konto_index": c["konto_index"],
-                    "konto_datum": c["datum_norm"],
-                    "konto_betrag": c["betrag_raw"],
-                    "konto_text": c["text_gesamt"],
-                    "score": c["score"],
-                    "datum_diff_tage": c["datum_diff_tage"],
-                })
-            continue
-
         if best["konto_index"] not in verwendete_konto_indices:
             verwendete_konto_indices.add(best["konto_index"])
             sichere_matches.append({
@@ -471,20 +460,18 @@ def run_analysis():
                 "beleg_rechnungsnr": beleg["invoice_number"],
             })
 
-    # ------------------ Unklare Fälle zusammenfassen ------------------
+    # ------------------ Unklare zusammenfassen ------------------
     unklare_faelle = []
     for beleg_idx, data in unklare_map.items():
         kandidaten = data["kandidaten"]
         if not kandidaten:
             continue
-        best = max(kandidaten, key=lambda c: (c["score"], -float(c.get("datum_diff_tage", 999999))))
+        best = max(kandidaten, key=lambda c: c["score"])
         konto_indices = sorted({k["konto_index"] for k in kandidaten})
-
         konto_scores_str = "; ".join(
             f"{k['konto_index']}:{k['score']}"
             for k in sorted(kandidaten, key=lambda c: (-c["score"], str(c["konto_index"])))
         )
-
         unklare_faelle.append({
             "typ": data["typ"],
             "beleg_index": data["beleg_index"],
@@ -518,15 +505,11 @@ def run_analysis():
     df_sicher = pd.DataFrame(sichere_matches)
     df_unklar = pd.DataFrame(unklare_faelle)
 
-    if not df_sicher.empty:
-        df_sicher.to_csv(OUTPUT_DIR / "matches_sicher.csv", sep=";", index=False, encoding="utf-8-sig")
-    else:
-        (OUTPUT_DIR / "matches_sicher.csv").write_text("keine sicheren Matches gefunden", encoding="utf-8")
+    df_sicher.to_csv(OUTPUT_DIR / "matches_sicher.csv", sep=";", index=False, encoding="utf-8-sig") \
+        if not df_sicher.empty else (OUTPUT_DIR / "matches_sicher.csv").write_text("keine sicheren Matches gefunden", encoding="utf-8")
 
-    if not df_unklar.empty:
-        df_unklar.to_csv(OUTPUT_DIR / "matches_unklar.csv", sep=";", index=False, encoding="utf-8-sig")
-    else:
-        (OUTPUT_DIR / "matches_unklar.csv").write_text("keine unklaren Fälle gefunden", encoding="utf-8")
+    df_unklar.to_csv(OUTPUT_DIR / "matches_unklar.csv", sep=";", index=False, encoding="utf-8-sig") \
+        if not df_unklar.empty else (OUTPUT_DIR / "matches_unklar.csv").write_text("keine unklaren Fälle gefunden", encoding="utf-8")
 
     konto_ohne_beleg.to_csv(OUTPUT_DIR / "konto_ohne_beleg.csv", sep=";", index=False, encoding="utf-8-sig")
 
@@ -718,10 +701,7 @@ async def run(konto_file: UploadFile = File(...), belege_file: UploadFile = File
         </ul>
 
         <a href="/download" class="button">Ergebnis-ZIP herunterladen</a>
-
-        <div style="margin-top: 1rem;">
-          <a href="/">Neue Analyse starten</a>
-        </div>
+        <div style="margin-top: 1rem;"><a href="/">Neue Analyse starten</a></div>
 
         <div class="legal">
           © NEXTWAVE GmbH – Alle Rechte vorbehalten.<br>
@@ -738,7 +718,6 @@ def download_zip():
     zip_path = OUTPUT_DIR / "datev_analyse_ergebnisse.zip"
     if not zip_path.exists():
         return HTMLResponse("<h1>Keine ZIP gefunden</h1><p>Bitte zuerst eine Analyse starten.</p>", status_code=404)
-
     return FileResponse(zip_path, media_type="application/zip", filename="datev_analyse_ergebnisse.zip")
 
 
