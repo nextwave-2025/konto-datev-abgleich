@@ -205,14 +205,46 @@ def normalize_for_search(s):
 def extract_refs(text_norm: str):
     if not text_norm:
         return []
+
     nums = re.findall(r"\d{7,12}", text_norm)
-    seen = set()
+
+    def is_ddmmyyyy(n: str) -> bool:
+        # ddmmyyyy
+        if len(n) != 8:
+            return False
+        try:
+            d = int(n[0:2])
+            m = int(n[2:4])
+            y = int(n[4:8])
+            return 1 <= d <= 31 and 1 <= m <= 12 and 1990 <= y <= 2100
+        except Exception:
+            return False
+
+    def is_yyyymmdd(n: str) -> bool:
+        # yyyymmdd
+        if len(n) != 8:
+            return False
+        try:
+            y = int(n[0:4])
+            m = int(n[4:6])
+            d = int(n[6:8])
+            return 1990 <= y <= 2100 and 1 <= m <= 12 and 1 <= d <= 31
+        except Exception:
+            return False
+
     out = []
+    seen = set()
     for n in nums:
+        # Filter: Datumszahlen raus
+        if is_ddmmyyyy(n) or is_yyyymmdd(n):
+            continue
+
         if n not in seen:
             seen.add(n)
             out.append(n)
+
     return out
+
 
 
 # ============================================================
